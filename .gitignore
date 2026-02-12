@@ -1,0 +1,2 @@
+certs/*.key
+esp32_demo/tools/certs/*.key

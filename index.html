@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Detecometre BLE Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow"></div>
+    <header class="hero">
+      <div>
+        <p class="eyebrow">ESP32 · Web Bluetooth · GitHub Pages</p>
+        <h1>Detecometre Live</h1>
+        <p class="subtitle">Connecte plusieurs ESP32, configure les capteurs et visualise les mesures en temps réel.</p>
+      </div>
+      <div class="hero-actions">
+        <button id="connectBtn" class="btn primary">Connecter un ESP32</button>
+        <button id="disconnectAllBtn" class="btn ghost">Tout déconnecter</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="notice" id="bleNotice">
+        <strong>Info:</strong> Web Bluetooth fonctionne uniquement en HTTPS (GitHub Pages OK) et sur Chrome/Edge (desktop ou Android).
+      </section>
+
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="config" role="tab" aria-selected="true">Configuration</button>
+        <button class="tab" data-tab="viz" role="tab" aria-selected="false">Visualisation</button>
+      </nav>
+
+      <section id="tab-config" class="tab-panel active" role="tabpanel">
+        <div class="panel-header">
+          <div>
+            <h2>Configuration des ESP32</h2>
+            <p>Associe chaque ESP32 a un type de capteur et un range. Puis envoie la config via BLE.</p>
+          </div>
+          <div class="legend">
+            <span class="dot online"></span> Connecte
+            <span class="dot offline"></span> Deconnecte
+          </div>
+        </div>
+        <div id="configList" class="card-grid"></div>
+        <div class="empty-state" id="configEmpty">
+          Aucun ESP32 connecte. Clique sur "Connecter un ESP32".
+        </div>
+      </section>
+
+      <section id="tab-viz" class="tab-panel" role="tabpanel">
+        <div class="panel-header">
+          <div>
+            <h2>Visualisation dynamique</h2>
+            <p>Des qu'un capteur envoie des donnees, un graphe et une jauge apparaissent.</p>
+          </div>
+          <div class="legend">
+            <span class="chip">Auto-scale chart</span>
+            <span class="chip">Jauge selon le range</span>
+          </div>
+        </div>
+        <div id="vizList" class="viz-grid"></div>
+        <div class="empty-state" id="vizEmpty">
+          En attente de donnees capteurs...
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>UUID service BLE et format message configurables dans <code>app.js</code>.</span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
