@@ -37,7 +37,7 @@
         <div class="panel-header">
           <div>
             <h2>Configuration des ESP32</h2>
-            <p>Associe chaque ESP32 a un type de capteur et un range. Puis envoie la config via BLE.</p>
+            <p>Modifie le nom BLE et les broches I2C (SDA/SCL) de chaque ESP32, puis envoie la mise a jour. Le taux d'utilisation de la FS (flash) s'affiche sur chaque carte.</p>
           </div>
           <div class="legend">
             <span class="dot online"></span> Connecte
@@ -67,6 +67,48 @@
         </div>
       </section>
     </main>
+
+    <div id="configModal" class="modal" aria-hidden="true">
+      <div class="modal-backdrop" data-modal-close="true"></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="configModalTitle">
+        <div class="modal-header">
+          <div>
+            <p class="eyebrow">Configuration</p>
+            <h3 id="configModalTitle">Configurer ESP32</h3>
+          </div>
+          <button type="button" class="btn ghost small" id="configModalClose">Fermer</button>
+        </div>
+        <form id="configModalForm" class="modal-body">
+          <div class="modal-grid">
+            <div class="field">
+              <label for="configModalName">Nom de l'ESP</label>
+              <input type="text" id="configModalName" placeholder="ESP32-Lab-01" />
+            </div>
+            <div class="field">
+              <label for="configModalSensor">Type de capteur</label>
+              <select id="configModalSensor"></select>
+            </div>
+          </div>
+          <div id="configModalPins" class="modal-grid"></div>
+          <div class="modal-grid">
+            <div class="field">
+              <label for="configModalFrequency">Frequence de mesure (ms)</label>
+              <input type="number" id="configModalFrequency" min="1" placeholder="1000" />
+            </div>
+            <label class="check-row">
+              <input type="checkbox" id="configModalStoreFlash" />
+              Enregistrer les valeurs dans la flash
+            </label>
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn ghost small" id="configModalClearFlash">Vider la flash</button>
+            <button type="button" class="btn ghost small" id="configModalExportFlash">Exporter la flash (CSV)</button>
+            <button type="submit" class="btn primary">Enregistrer</button>
+          </div>
+          <div class="config-status" id="configModalStatus"></div>
+        </form>
+      </div>
+    </div>
 
     <footer class="footer">
       <span>UUID service BLE et format message configurables dans <code>app.js</code>.</span>
