@@ -29,10 +29,6 @@ body {
   overflow-x: hidden;
 }
 
-body.modal-open {
-  overflow: hidden;
-}
-
 .bg-glow {
   position: fixed;
   inset: -20% 0 auto 50%;
@@ -240,110 +236,11 @@ h1 {
   margin-bottom: 10px;
 }
 
-.viz-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.history-wrap {
-  background: var(--card-2);
-  border-radius: 14px;
-  padding: 12px;
-  border: 1px solid rgba(21, 19, 15, 0.08);
-}
-
-.history-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.history-title {
-  font-weight: 600;
-}
-
-.history-toggle {
-  flex-shrink: 0;
-}
-
-.history-scroll {
-  margin-top: 8px;
-  max-height: 220px;
-  overflow-y: auto;
-}
-
-.history-wrap.collapsed .history-scroll {
-  display: none;
-}
-
-.history-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-
-.history-table th,
-.history-table td {
-  text-align: left;
-  padding: 6px 4px;
-  border-bottom: 1px solid rgba(21, 19, 15, 0.08);
-}
-
-.history-table tbody tr:last-child td {
-  border-bottom: none;
-}
-
 .config-meta {
   display: grid;
   gap: 6px;
   color: var(--muted);
   font-size: 13px;
-}
-
-.fs-usage {
-  display: grid;
-  gap: 8px;
-}
-
-.fs-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 13px;
-  color: var(--muted);
-}
-
-.fs-label {
-  font-weight: 600;
-  color: var(--ink);
-}
-
-.fs-value {
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 12px;
-}
-
-.fs-bar {
-  position: relative;
-  height: 8px;
-  border-radius: 999px;
-  background: rgba(21, 19, 15, 0.08);
-  overflow: hidden;
-}
-
-.fs-fill {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 0%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, rgba(47, 111, 104, 0.7), rgba(240, 138, 75, 0.85));
-  transition: width 0.4s ease;
-}
-
-.fs-bar.is-unknown .fs-fill {
-  background: rgba(21, 19, 15, 0.14);
 }
 
 .metric-chips {
@@ -390,54 +287,11 @@ label {
 }
 
 select,
-input[type="text"],
 input[type="number"] {
   border: 1px solid rgba(21, 19, 15, 0.16);
   border-radius: 10px;
   padding: 8px 10px;
   font-family: inherit;
-}
-
-.config-form {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.config-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
-}
-
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.config-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-}
-
-.config-status {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.config-status.ok {
-  color: var(--accent-2);
-}
-
-.config-status.info {
-  color: var(--muted);
-}
-
-.config-status.error {
-  color: #c96f4a;
 }
 
 .btn {
@@ -459,43 +313,6 @@ input[type="number"] {
   background: transparent;
   color: var(--ink);
   border: 1px solid rgba(21, 19, 15, 0.18);
-}
-
-.record-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid rgba(21, 19, 15, 0.18);
-  background: transparent;
-}
-
-.record-btn .record-indicator {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: #c2554a;
-  box-shadow: 0 0 0 3px rgba(194, 85, 74, 0.18);
-}
-
-.record-btn .record-label {
-  letter-spacing: 0.12em;
-  font-size: 11px;
-}
-
-.record-btn.is-recording {
-  border-color: rgba(21, 19, 15, 0.4);
-  color: var(--ink);
-}
-
-.record-btn.is-recording .record-indicator {
-  border-radius: 3px;
-  background: var(--ink);
-  box-shadow: none;
-}
-
-.record-btn:not(.is-recording) {
-  border-color: rgba(194, 85, 74, 0.5);
-  color: #b14a40;
 }
 
 .btn.small {
@@ -558,84 +375,6 @@ input[type="number"] {
   padding: 24px clamp(16px, 4vw, 64px) 40px;
   color: var(--muted);
   font-size: 13px;
-}
-
-.modal {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.2s ease;
-  z-index: 30;
-}
-
-.modal.open {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.modal-backdrop {
-  position: absolute;
-  inset: 0;
-  background: rgba(21, 19, 15, 0.45);
-  backdrop-filter: blur(2px);
-}
-
-.modal-card {
-  position: relative;
-  width: min(720px, 96vw);
-  max-height: 90vh;
-  overflow: auto;
-  background: var(--card);
-  border-radius: var(--radius);
-  padding: 22px;
-  box-shadow: var(--shadow);
-  border: 1px solid rgba(21, 19, 15, 0.12);
-  animation: fadeUp 0.3s ease;
-}
-
-.modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.modal-body {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.modal-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
-}
-
-.modal-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  align-items: center;
-}
-
-.check-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 14px;
-  color: var(--muted);
-}
-
-.check-row input {
-  width: 18px;
-  height: 18px;
 }
 
 @media (max-width: 720px) {

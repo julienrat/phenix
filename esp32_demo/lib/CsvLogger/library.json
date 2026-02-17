@@ -1,8 +1,0 @@
-{
-  "name": "CsvLogger",
-  "version": "1.0.0",
-  "description": "Simple CSV logger for ESP32 FS",
-  "keywords": "csv,fs,logger",
-  "frameworks": "arduino",
-  "platforms": "espressif32"
-}

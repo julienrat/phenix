@@ -4,24 +4,16 @@
 #include <NimBLEDevice.h>
 #include <NimBLEAdvertisementData.h>
 #include <Adafruit_BMP280.h>
-#include <Adafruit_NeoPixel.h>
 #include <MS5611.h>
 #include <Preferences.h>
 #include <LittleFS.h>
-#include <CsvLogger.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <ctype.h>
-#include <time.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include "esp_system.h"
 #include "esp_chip_info.h"
-#endif
-
-#if defined(USE_UART0_LOG)
-#undef Serial
-#define Serial Serial0
 #endif
 
 // Custom service/characteristic UUIDs (align with Web Bluetooth app)
@@ -38,12 +30,6 @@ static const uint8_t I2C_ADDR_BMP280_B = 0x77;
 static const uint8_t I2C_ADDR_MS5611_A = 0x77;
 static const uint8_t I2C_ADDR_MS5611_B = 0x76;
 static const char *LOG_PATH = "/log.csv";
-static const char *LOG_HEADER = "date_time,value1,value2";
-static const bool DEBUG_VERBOSE = true;
-static const uint8_t NEOPIXEL_COUNT = 1;
-static const uint8_t NEOPIXEL_BRIGHTNESS = 64;
-
-#define LOGVLN(msg) do { if (DEBUG_VERBOSE) { Serial.println(msg); } } while (0)
 
 static NimBLECharacteristic *txChar = nullptr;
 static NimBLEServer *bleServer = nullptr;
@@ -54,28 +40,6 @@ static uint32_t lastSensorMs = 0;
 static uint32_t lastScanMs = 0;
 static bool bleResetPending = false;
 static uint32_t bleResetAt = 0;
-static bool csvExportInProgress = false;
-static uint32_t csvExportId = 0;
-static uint32_t csvExportStartedAt = 0;
-static File csvStreamFile;
-static bool csvStreamActive = false;
-static bool csvAwaitAck = false;
-static uint32_t csvStreamId = 0;
-static uint32_t csvStreamSeq = 0;
-static uint32_t csvStreamLastSent = 0;
-static uint32_t csvStreamLastAck = 0;
-static bool csvStreamAllSent = false;
-static bool csvHasPendingLine = false;
-static std::string csvPendingLine;
-static uint32_t csvStreamLastActivityMs = 0;
-
-static const uint8_t CSV_ACK_WINDOW = 1;
-static bool serialDumpInProgress = false;
-static CsvLogger csvLogger(LittleFS, LOG_PATH, LOG_HEADER);
-
-#ifndef USE_COMPACT_METRICS
-#define USE_COMPACT_METRICS 1
-#endif
 
 static Adafruit_BMP280 *bmp280 = nullptr;
 static MS5611 *ms5611 = nullptr;
@@ -87,12 +51,6 @@ static Preferences prefs;
 static bool prefsReady = false;
 static uint32_t sensorIntervalMs = 1000;
 static bool littlefsReady = false;
-static Adafruit_NeoPixel *neoPixel = nullptr;
-static int neoPixelPin = -1;
-static int buttonStableState = HIGH;
-static int buttonLastRead = HIGH;
-static uint32_t buttonLastChangeMs = 0;
-static const uint32_t BUTTON_DEBOUNCE_MS = 40;
 
 struct DeviceConfig {
   std::string name;
@@ -102,8 +60,6 @@ struct DeviceConfig {
   int onewirePin = -1;
   int analogPin = -1;
   int digitalPin = -1;
-  int buttonPin = -1;
-  int neopixelPin = -1;
   uint32_t frequencyMs = 1000;
   bool storeFlash = false;
 };
@@ -122,10 +78,6 @@ struct ConfigUpdate {
   int analogPin = -1;
   bool hasDigital = false;
   int digitalPin = -1;
-  bool hasButton = false;
-  int buttonPin = -1;
-  bool hasNeoPixel = false;
-  int neopixelPin = -1;
   bool hasFrequency = false;
   uint32_t frequencyMs = 0;
   bool hasStoreFlash = false;
@@ -133,42 +85,20 @@ struct ConfigUpdate {
   bool hasAction = false;
   std::string action;
   std::string format;
-  bool hasEpochMs = false;
-  uint64_t epochMs = 0;
-  bool hasTzOffset = false;
-  int32_t tzOffsetMin = 0;
-  bool hasCsvAck = false;
-  uint32_t csvAckId = 0;
-  uint32_t csvAckSeq = 0;
 };
 
 static DeviceConfig deviceConfig;
-static bool timeSynced = false;
-static int64_t epochOffsetMs = 0;
-static int32_t tzOffsetMin = 0;
 
 
 static void clearSensors();
 static void scanSensors();
 static size_t estimateLineBytes();
-static void applyTimeSync(uint64_t epochMs);
-static void applyTzOffset(int32_t offsetMin);
-static uint64_t currentEpochMs();
-static uint64_t currentLocalMs();
-static void formatTimestamp(uint64_t epochMs, char *out, size_t outLen);
-static void applyUserIo();
-static void updateRecordingLed();
-static void handleButtonInput();
 static bool getFlashStats(size_t &total, size_t &used, size_t &freeSpace, size_t &logBytes);
 static bool buildFlashJson(std::string &out, bool withEstimates);
 static void sendFlashStatus();
 static size_t csvChunkBytes();
-static void sendCsvChunk(uint32_t exportId, uint32_t seq, uint32_t totalBytes, bool last, const std::string &chunk);
-static void endCsvStream();
-static void sendNextCsvBlock();
+static void sendCsvChunk(uint32_t seq, uint32_t totalBytes, bool last, const std::string &chunk);
 static void sendCsvFromFlash();
-static void handleSerialCommands();
-static void dumpCsvToSerial();
 
 static std::string trimCopy(const std::string &input) {
   size_t start = 0;
@@ -291,7 +221,6 @@ static bool ensureLittleFS() {
     Serial.print(LittleFS.totalBytes());
     Serial.print(" Used=");
     Serial.println(LittleFS.usedBytes());
-    LOGVLN("[LFS] Mount ok");
   }
   return littlefsReady;
 }
@@ -365,8 +294,6 @@ static void loadConfig() {
   deviceConfig.onewirePin = prefs.getInt("onewire_pin", -1);
   deviceConfig.analogPin = prefs.getInt("analog_pin", -1);
   deviceConfig.digitalPin = prefs.getInt("digital_pin", -1);
-  deviceConfig.buttonPin = prefs.getInt("button_pin", -1);
-  deviceConfig.neopixelPin = prefs.getInt("neopixel_pin", -1);
   deviceConfig.frequencyMs = prefs.getUInt("freq_ms", 1000);
   deviceConfig.storeFlash = prefs.getBool("store_flash", false);
   sensorIntervalMs = deviceConfig.frequencyMs ? deviceConfig.frequencyMs : 1000;
@@ -382,8 +309,6 @@ static void saveConfig() {
   prefs.putInt("onewire_pin", deviceConfig.onewirePin);
   prefs.putInt("analog_pin", deviceConfig.analogPin);
   prefs.putInt("digital_pin", deviceConfig.digitalPin);
-  prefs.putInt("button_pin", deviceConfig.buttonPin);
-  prefs.putInt("neopixel_pin", deviceConfig.neopixelPin);
   prefs.putUInt("freq_ms", deviceConfig.frequencyMs);
   prefs.putBool("store_flash", deviceConfig.storeFlash);
 }
@@ -402,12 +327,6 @@ static void sendNameAck(const char *status, const std::string &name, const char 
   }
   Serial.print("[BLE] ACK: ");
   Serial.println(payload);
-  if (DEBUG_VERBOSE) {
-    Serial.print("[ACK] name status=");
-    Serial.print(status);
-    Serial.print(" name=");
-    Serial.println(name.c_str());
-  }
   txChar->setValue(payload);
   txChar->notify();
 }
@@ -485,14 +404,6 @@ static bool extractJsonNumberFieldU32(const std::string &json, const char *key, 
   long val = atol(temp.c_str());
   if (val < 0) return false;
   out = (uint32_t)val;
-  return true;
-}
-
-static bool extractJsonNumberFieldU64(const std::string &json, const char *key, uint64_t &out) {
-  std::string temp;
-  if (!extractJsonStringField(json, key, temp)) return false;
-  unsigned long long val = strtoull(temp.c_str(), nullptr, 10);
-  out = (uint64_t)val;
   return true;
 }
 
@@ -673,20 +584,6 @@ static std::string buildConfigJson() {
     out += "}";
     first = false;
   }
-  if (deviceConfig.buttonPin >= 0) {
-    if (!first) out += ",";
-    out += "\"button\":{\"pin\":";
-    out += String(deviceConfig.buttonPin).c_str();
-    out += "}";
-    first = false;
-  }
-  if (deviceConfig.neopixelPin >= 0) {
-    if (!first) out += ",";
-    out += "\"neopixel\":{\"pin\":";
-    out += String(deviceConfig.neopixelPin).c_str();
-    out += "}";
-    first = false;
-  }
 
   std::string flashJson;
   if (buildFlashJson(flashJson, true)) {
@@ -720,10 +617,6 @@ static void sendFlashStatus() {
   payload += "}";
   Serial.print("[BLE] TX: ");
   Serial.println(payload.c_str());
-  if (DEBUG_VERBOSE) {
-    Serial.print("[FLASH] Status bytes=");
-    Serial.println((unsigned int)payload.size());
-  }
   txChar->setValue(payload);
   txChar->notify();
 }
@@ -735,162 +628,73 @@ static void sendCsvPayload(const std::string &csv) {
   payload += "\"}";
   Serial.print("[BLE] TX CSV bytes=");
   Serial.println(payload.size());
-  if (DEBUG_VERBOSE) {
-    Serial.print("[CSV] Inline payload bytes=");
-    Serial.print((unsigned int)payload.size());
-    Serial.print(" data=");
-    Serial.println((unsigned int)csv.size());
-  }
   txChar->setValue(payload);
   txChar->notify();
 }
 
-static void sendProfilesForSensor(const std::string &sensor) {
+static void sendProfiles() {
   if (!txChar) return;
-  std::string payload = "{\"profiles\":{";
-  bool first = true;
-  auto addProfile = [&](const char *key, const char *label, const char *unit, int minVal, int maxVal) {
-    if (!first) payload += ",";
-    payload += "\"";
-    payload += key;
-    payload += "\":{\"label\":\"";
-    payload += label;
-    payload += "\",\"unit\":\"";
-    payload += unit;
-    payload += "\",\"min\":";
-    payload += std::to_string(minVal);
-    payload += ",\"max\":";
-    payload += std::to_string(maxVal);
-    payload += "}";
-    first = false;
-  };
-
-  if (sensor == "i2c") {
-    addProfile("temperature", "Temperature", "C", -10, 50);
-    addProfile("pressure", "Pression", "hPa", 900, 1100);
-  } else if (sensor == "onewire") {
-    addProfile("temperature", "Temperature", "C", -10, 50);
-  } else {
-    addProfile("generic", "Valeur", "", 0, 100);
-  }
-  payload += "}}";
+  const char *payload =
+    "{\"profiles\":{"
+    "\"temperature\":{\"label\":\"Temperature\",\"unit\":\"C\",\"min\":-10,\"max\":50},"
+    "\"pressure\":{\"label\":\"Pression\",\"unit\":\"hPa\",\"min\":900,\"max\":1100},"
+    "\"generic\":{\"label\":\"Valeur\",\"unit\":\"\",\"min\":0,\"max\":100}"
+    "}}";
   Serial.print("[BLE] TX: ");
-  Serial.println(payload.c_str());
+  Serial.println(payload);
   txChar->setValue(payload);
   txChar->notify();
 }
 
 static bool ensureLogFile() {
   if (!ensureLittleFS()) return false;
-  const bool ok = csvLogger.begin(true);
-  if (DEBUG_VERBOSE && ok) {
-    Serial.print("[FLASH] Log ready at ");
-    Serial.println(LOG_PATH);
-  }
-  return ok;
+  if (LittleFS.exists(LOG_PATH)) return true;
+  File file = LittleFS.open(LOG_PATH, "w");
+  if (!file) return false;
+  file.print("ts_ms,value1,value2\n");
+  file.close();
+  return true;
 }
 
 static void flashClear() {
   if (!ensureLittleFS()) return;
   if (LittleFS.exists(LOG_PATH)) {
     LittleFS.remove(LOG_PATH);
-    if (DEBUG_VERBOSE) {
-      Serial.print("[FLASH] Log file cleared (");
-      Serial.print(LOG_PATH);
-      Serial.println(")");
-    }
-  } else {
-    if (DEBUG_VERBOSE) {
-      Serial.print("[FLASH] Log file not found (");
-      Serial.print(LOG_PATH);
-      Serial.println(")");
-    }
   }
 }
 
 static size_t estimateLineBytes() {
   const std::string sensor = normalizeSensor(deviceConfig.sensor);
-  if (sensor == "i2c") return 32;
-  return 24;
-}
-
-static void applyTimeSync(uint64_t epochMs) {
-  epochOffsetMs = (int64_t)epochMs - (int64_t)millis();
-  timeSynced = true;
-  if (DEBUG_VERBOSE) {
-    Serial.print("[TIME] Sync epoch_ms=");
-    Serial.print((unsigned long long)epochMs);
-    Serial.print(" offset=");
-    Serial.println((long long)epochOffsetMs);
+  char line[80];
+  if (sensor == "i2c") {
+    snprintf(line, sizeof(line), "%lu,%.2f,%.2f\n", 4294967295UL, -123.45f, -1234.56f);
+  } else {
+    snprintf(line, sizeof(line), "%lu,%.2f,\n", 4294967295UL, -123.45f);
   }
-}
-
-static void applyTzOffset(int32_t offsetMin) {
-  tzOffsetMin = offsetMin;
-  if (DEBUG_VERBOSE) {
-    Serial.print("[TIME] TZ offset min=");
-    Serial.println(tzOffsetMin);
-  }
-}
-
-static uint64_t currentEpochMs() {
-  if (!timeSynced) return (uint64_t)millis();
-  int64_t now = epochOffsetMs + (int64_t)millis();
-  if (now < 0) return 0;
-  return (uint64_t)now;
-}
-
-static uint64_t currentLocalMs() {
-  int64_t local = (int64_t)currentEpochMs() - (int64_t)tzOffsetMin * 60000LL;
-  if (local < 0) return 0;
-  return (uint64_t)local;
-}
-
-static void formatTimestamp(uint64_t epochMs, char *out, size_t outLen) {
-  if (!out || outLen == 0) return;
-  time_t seconds = (time_t)(epochMs / 1000ULL);
-  struct tm tmInfo;
-  gmtime_r(&seconds, &tmInfo);
-  int year = (tmInfo.tm_year + 1900) % 100;
-  snprintf(out, outLen, "%02d/%02d/%02d %02d:%02d:%02d",
-           tmInfo.tm_mday, tmInfo.tm_mon + 1, year,
-           tmInfo.tm_hour, tmInfo.tm_min, tmInfo.tm_sec);
+  return strlen(line);
 }
 
 static void flashLog(float v1, float v2) {
   if (!deviceConfig.storeFlash) return;
-  if (csvExportInProgress) return;
   if (!ensureLogFile()) return;
-  char tsBuf[24];
-  char v1buf[16];
-  char v2buf[16];
-  formatTimestamp(currentLocalMs(), tsBuf, sizeof(tsBuf));
-  snprintf(v1buf, sizeof(v1buf), "%.2f", v1);
+  File file = LittleFS.open(LOG_PATH, "a");
+  if (!file) return;
+  char line[80];
+  unsigned long ts = millis();
   if (isfinite(v2)) {
-    snprintf(v2buf, sizeof(v2buf), "%.2f", v2);
+    snprintf(line, sizeof(line), "%lu,%.2f,%.2f\n", ts, v1, v2);
   } else {
-    v2buf[0] = '\0';
+    snprintf(line, sizeof(line), "%lu,%.2f,\n", ts, v1);
   }
-  csvLogger.appendRow(tsBuf, v1buf, v2buf);
-  if (DEBUG_VERBOSE) {
-    Serial.print("[FLASH] Log ts=");
-    Serial.print(tsBuf);
-    Serial.print(" v1=");
-    Serial.print(v1, 2);
-    Serial.print(" v2=");
-    if (isfinite(v2)) {
-      Serial.println(v2, 2);
-    } else {
-      Serial.println("nan");
-    }
-  }
+  file.print(line);
+  file.close();
 }
 
 static std::string readFlashCsv() {
-  if (!ensureLittleFS()) return std::string(LOG_HEADER) + "\n";
-  if (!LittleFS.exists(LOG_PATH)) return std::string(LOG_HEADER) + "\n";
+  if (!ensureLittleFS()) return "ts_ms,value1,value2\n";
+  if (!LittleFS.exists(LOG_PATH)) return "ts_ms,value1,value2\n";
   File file = LittleFS.open(LOG_PATH, "r");
-  if (!file) return std::string(LOG_HEADER) + "\n";
+  if (!file) return "ts_ms,value1,value2\n";
   std::string out;
   out.reserve(file.size() + 16);
   while (file.available()) {
@@ -903,20 +707,17 @@ static std::string readFlashCsv() {
 static size_t csvChunkBytes() {
   const uint16_t mtu = bleMtu ? bleMtu : NimBLEDevice::getMTU();
   const size_t maxPayload = mtu > 3 ? (size_t)(mtu - 3) : 20;
-  // Conservative overhead to avoid MTU overflow with JSON + escaping.
-  const size_t overhead = 90;
+  const size_t overhead = 70;
   if (maxPayload <= overhead + 8) return 0;
   size_t chunk = maxPayload - overhead;
-  if (chunk > 96) chunk = 96;
+  if (chunk > 160) chunk = 160;
   return chunk;
 }
 
-static void sendCsvChunk(uint32_t exportId, uint32_t seq, uint32_t totalBytes, bool last, const std::string &chunk) {
+static void sendCsvChunk(uint32_t seq, uint32_t totalBytes, bool last, const std::string &chunk) {
   if (!txChar) return;
   std::string payload = "{\"csv_chunk\":{\"seq\":";
   payload += std::to_string(seq);
-  payload += ",\"id\":";
-  payload += std::to_string(exportId);
   payload += ",\"total\":";
   payload += std::to_string(totalBytes);
   payload += ",\"last\":";
@@ -928,249 +729,55 @@ static void sendCsvChunk(uint32_t exportId, uint32_t seq, uint32_t totalBytes, b
   Serial.print(seq);
   Serial.print(" bytes=");
   Serial.println(payload.size());
-  if (DEBUG_VERBOSE) {
-    Serial.print("[CSV] Chunk seq=");
-    Serial.print((unsigned long)seq);
-    Serial.print(" last=");
-    Serial.print(last ? "true" : "false");
-    Serial.print(" data=");
-    Serial.print((unsigned int)chunk.size());
-    Serial.print(" total=");
-    Serial.print((unsigned long)totalBytes);
-    Serial.print(" id=");
-    Serial.print((unsigned long)exportId);
-    Serial.print(" payload=");
-    Serial.println((unsigned int)payload.size());
-  }
   txChar->setValue(payload);
   txChar->notify();
 }
 
 static void sendCsvFromFlash() {
-  LOGVLN("[CSV] Export requested");
-  if (csvStreamActive) return;
-  csvExportInProgress = true;
-  csvExportStartedAt = millis();
-  csvStreamId = ++csvExportId;
-  csvStreamSeq = 0;
-  csvStreamLastSent = 0;
-  csvStreamLastAck = 0;
-  csvStreamAllSent = false;
-  csvAwaitAck = false;
-  csvStreamLastActivityMs = millis();
-
-  if (!ensureLogFile()) {
+  if (!ensureLittleFS()) {
     sendFlashAck("flash_export", "error", "Flash indisponible");
-    endCsvStream();
     return;
   }
-  File sizeFile = LittleFS.open(LOG_PATH, "r");
-  size_t totalBytes = 0;
-  if (sizeFile) {
-    totalBytes = sizeFile.size();
-    sizeFile.close();
-  }
-  const uint16_t mtu = bleMtu ? bleMtu : NimBLEDevice::getMTU();
-  const size_t maxPayload = mtu > 3 ? (size_t)(mtu - 3) : 20;
-  if (totalBytes > 0 && totalBytes <= 900) {
-    File inlineFile = LittleFS.open(LOG_PATH, "r");
-    if (inlineFile) {
-      std::string csv;
-      csv.reserve(totalBytes + 8);
-      while (inlineFile.available()) {
-        csv.push_back((char)inlineFile.read());
-      }
-      inlineFile.close();
-      std::string payload = "{\"csv\":\"";
-      payload += escapeJson(csv);
-      payload += "\"}";
-      if (payload.size() <= maxPayload) {
-        if (DEBUG_VERBOSE) {
-          Serial.print("[CSV] Inline send bytes=");
-          Serial.println((unsigned int)payload.size());
-        }
-        sendCsvPayload(csv);
-        endCsvStream();
-        return;
-      }
-    }
-  }
-
-  csvStreamFile = LittleFS.open(LOG_PATH, "r");
-  if (!csvStreamFile) {
-    sendFlashAck("flash_export", "error", "Lecture flash impossible");
-    endCsvStream();
-    return;
-  }
-  if (DEBUG_VERBOSE) {
-    Serial.print("[CSV] Stream start id=");
-    Serial.println((unsigned long)csvStreamId);
-  }
-  csvStreamActive = true;
-  sendNextCsvBlock();
-}
-
-static void sendNextCsvBlock() {
-  if (!csvStreamActive || csvAwaitAck || !txChar) return;
-  if (!csvStreamFile) {
-    endCsvStream();
-    return;
-  }
-  if (!csvStreamFile.available() && !csvHasPendingLine) {
-    endCsvStream();
-    return;
-  }
-  const uint16_t mtu = bleMtu ? bleMtu : NimBLEDevice::getMTU();
-  const size_t maxPayload = mtu > 3 ? (size_t)(mtu - 3) : 20;
-  std::string block;
-  bool last = false;
-  while (csvStreamFile.available() || csvHasPendingLine) {
-    std::string line;
-    if (csvHasPendingLine) {
-      line = csvPendingLine;
-      csvPendingLine.clear();
-      csvHasPendingLine = false;
-    } else {
-      String raw = csvStreamFile.readStringUntil('\n');
-      raw.trim();
-      if (raw.length() == 0) {
-        if (!csvStreamFile.available()) last = true;
-        if (last && block.empty()) break;
-        if (last) break;
-        continue;
-      }
-      line = std::string(raw.c_str());
-    }
-
-    std::string candidate = block.empty() ? line : block + "\n" + line;
-    const bool candidateLast = !csvStreamFile.available() && !csvHasPendingLine;
-    std::string payload = "{\"csv_block\":{\"id\":";
-    payload += std::to_string(csvStreamId);
-    payload += ",\"seq\":";
-    payload += std::to_string(csvStreamSeq);
-    payload += ",\"last\":";
-    payload += candidateLast ? "true" : "false";
-    payload += ",\"data\":\"";
-    payload += escapeJson(candidate);
-    payload += "\"}}";
-
-    if (payload.size() <= maxPayload) {
-      block = candidate;
-      last = candidateLast;
-      if (candidateLast) break;
-      continue;
-    }
-
-    if (block.empty()) {
-      block = candidate;
-      last = candidateLast;
-    } else {
-      csvPendingLine = line;
-      csvHasPendingLine = true;
-      last = false;
-    }
-    break;
-  }
-
-  if (block.empty()) {
-    endCsvStream();
-    return;
-  }
-
-  std::string payload = "{\"csv_block\":{\"id\":";
-  payload += std::to_string(csvStreamId);
-  payload += ",\"seq\":";
-  payload += std::to_string(csvStreamSeq);
-  payload += ",\"last\":";
-  payload += last ? "true" : "false";
-  payload += ",\"data\":\"";
-  payload += escapeJson(block);
-  payload += "\"}}";
-  Serial.print("[BLE] TX CSV block=");
-  Serial.print(csvStreamSeq);
-  Serial.print(" bytes=");
-  Serial.println(payload.size());
-  txChar->setValue(payload);
-  txChar->notify();
-  csvStreamLastActivityMs = millis();
-  csvStreamLastSent = csvStreamSeq;
-  csvStreamSeq++;
-  if (last) {
-    csvStreamAllSent = true;
-  }
-  if (csvStreamAllSent || (csvStreamLastSent - csvStreamLastAck + 1) >= CSV_ACK_WINDOW) {
-    csvAwaitAck = true;
-  } else {
-    // Send next block immediately if window allows.
-    sendNextCsvBlock();
-  }
-}
-
-static void endCsvStream() {
-  if (csvStreamFile) {
-    csvStreamFile.close();
-  }
-  csvStreamActive = false;
-  csvAwaitAck = false;
-  csvExportInProgress = false;
-  csvExportStartedAt = 0;
-  csvHasPendingLine = false;
-  csvPendingLine.clear();
-  csvStreamLastAck = 0;
-  csvStreamAllSent = false;
-  csvStreamLastActivityMs = 0;
-}
-
-static void dumpCsvToSerial() {
-  if (serialDumpInProgress) return;
-  serialDumpInProgress = true;
-  csvExportInProgress = true;
-  if (!ensureLogFile()) {
-    Serial.println("CSV_ERROR");
-    serialDumpInProgress = false;
-    csvExportInProgress = false;
+  if (!LittleFS.exists(LOG_PATH)) {
+    sendCsvPayload("ts_ms,value1,value2\n");
     return;
   }
   File file = LittleFS.open(LOG_PATH, "r");
   if (!file) {
-    Serial.println("CSV_ERROR");
-    serialDumpInProgress = false;
-    csvExportInProgress = false;
+    sendFlashAck("flash_export", "error", "Lecture flash impossible");
     return;
   }
-  Serial.println("CSV_BEGIN");
-  Serial.print("CSV_SIZE:");
-  Serial.println((unsigned long)file.size());
-  char buf[128];
+  const size_t totalBytes = file.size();
+  const size_t inlineLimit = 600;
+  if (totalBytes <= inlineLimit) {
+    std::string out;
+    out.reserve(totalBytes + 8);
+    while (file.available()) {
+      out.push_back((char)file.read());
+    }
+    file.close();
+    sendCsvPayload(out);
+    return;
+  }
+  const size_t chunkSize = csvChunkBytes();
+  if (chunkSize == 0) {
+    file.close();
+    sendFlashAck("flash_export", "error", "MTU BLE trop faible");
+    return;
+  }
+  uint32_t seq = 0;
+  std::string chunk;
+  chunk.reserve(chunkSize);
   while (file.available()) {
-    size_t n = file.readBytes(buf, sizeof(buf));
-    if (n > 0) Serial.write((uint8_t *)buf, n);
+    chunk.clear();
+    for (size_t i = 0; i < chunkSize && file.available(); ++i) {
+      chunk.push_back((char)file.read());
+    }
+    const bool last = !file.available();
+    sendCsvChunk(seq++, (uint32_t)totalBytes, last, chunk);
+    delay(5);
   }
   file.close();
-  Serial.println();
-  Serial.println("CSV_END");
-  serialDumpInProgress = false;
-  csvExportInProgress = false;
-}
-
-static void handleSerialCommands() {
-  static String cmd;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      cmd.trim();
-      if (cmd.length() > 0) {
-        if (cmd == "CSV_DUMP") {
-          dumpCsvToSerial();
-        }
-      }
-      cmd = "";
-    } else {
-      if (cmd.length() < 64) {
-        cmd += c;
-      }
-    }
-  }
 }
 
 static void applyI2cConfig() {
@@ -1218,72 +825,9 @@ static void applySensorMode() {
   }
 }
 
-static void updateRecordingLed() {
-  if (!neoPixel) return;
-  if (deviceConfig.storeFlash) {
-    neoPixel->setPixelColor(0, neoPixel->Color(255, 0, 0));
-  } else {
-    neoPixel->setPixelColor(0, 0);
-  }
-  neoPixel->show();
-}
-
-static void applyUserIo() {
-  if (deviceConfig.buttonPin >= 0) {
-    pinMode(deviceConfig.buttonPin, INPUT_PULLUP);
-    buttonLastRead = digitalRead(deviceConfig.buttonPin);
-    buttonStableState = buttonLastRead;
-    buttonLastChangeMs = millis();
-  } else {
-    buttonLastRead = HIGH;
-    buttonStableState = HIGH;
-    buttonLastChangeMs = millis();
-  }
-
-  if (neoPixel) {
-    neoPixel->clear();
-    neoPixel->show();
-    delete neoPixel;
-    neoPixel = nullptr;
-  }
-  neoPixelPin = -1;
-  if (deviceConfig.neopixelPin >= 0) {
-    neoPixel = new Adafruit_NeoPixel(NEOPIXEL_COUNT, deviceConfig.neopixelPin, NEO_GRB + NEO_KHZ800);
-    neoPixel->begin();
-    neoPixel->setBrightness(NEOPIXEL_BRIGHTNESS);
-    neoPixel->clear();
-    neoPixel->show();
-    neoPixelPin = deviceConfig.neopixelPin;
-  }
-  updateRecordingLed();
-}
-
-static void handleButtonInput() {
-  if (deviceConfig.buttonPin < 0) return;
-  const uint32_t now = millis();
-  int reading = digitalRead(deviceConfig.buttonPin);
-  if (reading != buttonLastRead) {
-    buttonLastChangeMs = now;
-    buttonLastRead = reading;
-  }
-  if ((now - buttonLastChangeMs) > BUTTON_DEBOUNCE_MS && reading != buttonStableState) {
-    buttonStableState = reading;
-    if (buttonStableState == LOW) {
-      deviceConfig.storeFlash = !deviceConfig.storeFlash;
-      saveConfig();
-      updateRecordingLed();
-      if (connectedCount > 0) {
-        sendConfigPayload();
-        sendFlashStatus();
-      }
-    }
-  }
-}
-
 static bool applyConfigUpdate(const ConfigUpdate &update) {
   bool changed = false;
   bool modeTouched = false;
-  bool ioTouched = false;
 
   if (update.hasName) {
     std::string applied;
@@ -1318,16 +862,6 @@ static bool applyConfigUpdate(const ConfigUpdate &update) {
     changed = true;
     modeTouched = true;
   }
-  if (update.hasButton) {
-    deviceConfig.buttonPin = update.buttonPin;
-    changed = true;
-    ioTouched = true;
-  }
-  if (update.hasNeoPixel) {
-    deviceConfig.neopixelPin = update.neopixelPin;
-    changed = true;
-    ioTouched = true;
-  }
   if (update.hasFrequency) {
     deviceConfig.frequencyMs = update.frequencyMs ? update.frequencyMs : 1000;
     sensorIntervalMs = deviceConfig.frequencyMs;
@@ -1336,17 +870,10 @@ static bool applyConfigUpdate(const ConfigUpdate &update) {
   if (update.hasStoreFlash) {
     deviceConfig.storeFlash = update.storeFlash;
     changed = true;
-    updateRecordingLed();
   }
 
   if (modeTouched) {
     applySensorMode();
-    if (connectedCount > 0) {
-      sendProfilesForSensor(normalizeSensor(deviceConfig.sensor));
-    }
-  }
-  if (ioTouched) {
-    applyUserIo();
   }
 
   if (changed) saveConfig();
@@ -1364,40 +891,6 @@ static ConfigUpdate parseConfigUpdate(const std::string &value) {
       update.hasAction = true;
       update.action = lowerCopy(action);
       extractJsonStringField(trimmed, "format", update.format);
-    }
-
-    uint64_t epochMs = 0;
-    if (extractJsonNumberFieldU64(trimmed, "epoch_ms", epochMs)
-        || extractJsonNumberFieldU64(trimmed, "epoch", epochMs)
-        || extractJsonNumberFieldU64(trimmed, "time_ms", epochMs)
-        || extractJsonNumberFieldU64(trimmed, "timestamp", epochMs)) {
-      update.hasEpochMs = true;
-      update.epochMs = epochMs;
-    }
-
-    int tzMin = 0;
-    if (extractJsonNumberField(trimmed, "tz_offset_min", tzMin)
-        || extractJsonNumberField(trimmed, "tzOffsetMin", tzMin)
-        || extractJsonNumberField(trimmed, "tz", tzMin)) {
-      update.hasTzOffset = true;
-      update.tzOffsetMin = tzMin;
-    }
-
-    if (update.hasAction && update.action == "csv_ack") {
-      uint32_t ackId = 0;
-      uint32_t ackSeq = 0;
-      bool got = false;
-      if (extractJsonNumberFieldU32(trimmed, "id", ackId)
-          || extractJsonNumberFieldU32(trimmed, "export_id", ackId)
-          || extractJsonNumberFieldU32(trimmed, "exportId", ackId)) {
-        update.csvAckId = ackId;
-        got = true;
-      }
-      if (extractJsonNumberFieldU32(trimmed, "seq", ackSeq)) {
-        update.csvAckSeq = ackSeq;
-        got = true;
-      }
-      update.hasCsvAck = got;
     }
 
     if (extractJsonStringField(trimmed, "name", update.name)) update.hasName = true;
@@ -1497,39 +990,6 @@ static ConfigUpdate parseConfigUpdate(const std::string &value) {
       if (extractJsonNumberField(trimmed, "digital", pin)) {
         update.hasDigital = true;
         update.digitalPin = pin;
-      }
-    }
-
-    std::string buttonObj;
-    if (extractJsonObjectField(trimmed, "button", buttonObj)) {
-      int pin = -1;
-      if (extractJsonNumberField(buttonObj, "pin", pin)) {
-        update.hasButton = true;
-        update.buttonPin = pin;
-      }
-    } else {
-      int pin = -1;
-      if (extractJsonNumberField(trimmed, "button", pin)
-          || extractJsonNumberField(trimmed, "button_pin", pin)) {
-        update.hasButton = true;
-        update.buttonPin = pin;
-      }
-    }
-
-    std::string neoObj;
-    if (extractJsonObjectField(trimmed, "neopixel", neoObj) || extractJsonObjectField(trimmed, "neo", neoObj)) {
-      int pin = -1;
-      if (extractJsonNumberField(neoObj, "pin", pin)) {
-        update.hasNeoPixel = true;
-        update.neopixelPin = pin;
-      }
-    } else {
-      int pin = -1;
-      if (extractJsonNumberField(trimmed, "neopixel", pin)
-          || extractJsonNumberField(trimmed, "neopixel_pin", pin)
-          || extractJsonNumberField(trimmed, "neo", pin)) {
-        update.hasNeoPixel = true;
-        update.neopixelPin = pin;
       }
     }
 
@@ -1680,48 +1140,9 @@ static bool readOneWire(float &tempC) {
   return true;
 }
 
-static const char *compactMetricKey(const char *key) {
-  if (!key || !key[0]) return "";
-  if (strcmp(key, "generic") == 0) return "g";
-  if (strcmp(key, "temperature") == 0) return "t";
-  if (strcmp(key, "pressure") == 0) return "p";
-  if (strcmp(key, "humidity") == 0) return "h";
-  return key;
-}
-
 static void sendMetricPayload(const char *sensor, const char *addr, const char *key1, float v1, const char *key2, float v2) {
   if (!txChar) return;
   char payload[220];
-#if USE_COMPACT_METRICS
-  const char *k1 = compactMetricKey(key1);
-  const char *k2 = compactMetricKey(key2);
-  char tsBuf[24] = {0};
-  const bool haveTs = timeSynced;
-  if (haveTs) {
-    formatTimestamp(currentLocalMs(), tsBuf, sizeof(tsBuf));
-  }
-  if (key2) {
-    if (haveTs) {
-      snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f,\"%s\":%.2f},\"ts\":\"%s\"}",
-               k1, v1, k2, v2, tsBuf);
-    } else {
-      snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f,\"%s\":%.2f}}",
-               k1, v1, k2, v2);
-    }
-  } else {
-    if (haveTs) {
-      snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f},\"ts\":\"%s\"}",
-               k1, v1, tsBuf);
-    } else {
-      snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f}}",
-               k1, v1);
-    }
-  }
-#else
   if (key2) {
     snprintf(payload, sizeof(payload),
              "{\"sensor\":\"%s\",\"addr\":\"%s\",\"name\":\"%s\",\"metrics\":{\"%s\":%.2f,\"%s\":%.2f}}",
@@ -1731,7 +1152,6 @@ static void sendMetricPayload(const char *sensor, const char *addr, const char *
              "{\"sensor\":\"%s\",\"addr\":\"%s\",\"name\":\"%s\",\"metrics\":{\"%s\":%.2f}}",
              sensor, addr ? addr : "", bleName, key1, v1);
   }
-#endif
   Serial.print("[BLE] TX: ");
   Serial.println(payload);
   txChar->setValue(payload);
@@ -1748,18 +1168,6 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
     ConfigUpdate update = parseConfigUpdate(value);
 
     if (update.hasAction) {
-      if (update.action == "time_sync") {
-        if (update.hasTzOffset) {
-          applyTzOffset(update.tzOffsetMin);
-        }
-        if (update.hasEpochMs) {
-          applyTimeSync(update.epochMs);
-          sendFlashAck("time_sync", "ok", "Heure synchronisee");
-        } else {
-          sendFlashAck("time_sync", "error", "Timestamp manquant");
-        }
-        return;
-      }
       if (update.action == "config_get") {
         sendConfigPayload();
         return;
@@ -1771,45 +1179,9 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         return;
       }
       if (update.action == "flash_export") {
-        if (csvExportInProgress) {
-          sendFlashAck("flash_export", "error", "Export en cours");
-          return;
-        }
         sendFlashAck("flash_export", "ok", "Export CSV");
         sendFlashStatus();
         sendCsvFromFlash();
-        return;
-      }
-      if (update.action == "flash_stream") {
-        if (csvExportInProgress) {
-          sendFlashAck("flash_stream", "error", "Export en cours");
-          return;
-        }
-        sendFlashAck("flash_stream", "ok", "Stream CSV");
-        sendFlashStatus();
-        sendCsvFromFlash();
-        return;
-      }
-      if (update.action == "flash_stream_stop") {
-        endCsvStream();
-        sendFlashAck("flash_stream_stop", "ok", "Stream stop");
-        return;
-      }
-      if (update.action == "csv_ack") {
-        if (update.hasCsvAck && csvStreamActive && csvAwaitAck
-            && update.csvAckId == csvStreamId
-            && update.csvAckSeq == csvStreamLastSent) {
-          if (update.csvAckSeq >= csvStreamLastAck) {
-            csvStreamLastAck = update.csvAckSeq;
-          }
-          csvStreamLastActivityMs = millis();
-          if (csvStreamAllSent && csvStreamLastAck >= csvStreamLastSent) {
-            endCsvStream();
-          } else {
-            csvAwaitAck = false;
-            sendNextCsvBlock();
-          }
-        }
         return;
       }
       if (update.action == "flash_status") {
@@ -1817,13 +1189,6 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         sendConfigPayload();
         return;
       }
-    }
-
-    if (update.hasEpochMs) {
-      applyTimeSync(update.epochMs);
-    }
-    if (update.hasTzOffset) {
-      applyTzOffset(update.tzOffsetMin);
     }
 
     bool nameHandled = false;
@@ -1867,7 +1232,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     Serial.println(connectedCount);
     // Keep advertising to allow multiple centrals to connect
     NimBLEDevice::startAdvertising();
-    sendProfilesForSensor(normalizeSensor(deviceConfig.sensor));
+    sendProfiles();
   }
 
   void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
@@ -1876,7 +1241,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     Serial.print("[BLE] Disconnected, reason=");
     Serial.println(reason);
     connectedCount = bleServer ? bleServer->getConnectedCount() : 0;
-    bleMtu = 23;
     Serial.print("[BLE] Connected count=");
     Serial.println(connectedCount);
     const bool restarted = NimBLEDevice::startAdvertising();
@@ -1884,20 +1248,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     Serial.println(restarted ? "OK" : "FAIL");
 
     if (connectedCount == 0) {
-      csvExportInProgress = false;
-      csvExportStartedAt = 0;
-      endCsvStream();
       bleResetPending = true;
       bleResetAt = millis() + 200;
       Serial.println("[BLE] Reset scheduled");
     }
-  }
-
-  void onMTUChange(uint16_t MTU, NimBLEConnInfo &connInfo) override {
-    (void)connInfo;
-    bleMtu = MTU;
-    Serial.print("[BLE] MTU update=");
-    Serial.println(bleMtu);
   }
 };
 
@@ -1986,12 +1340,6 @@ static void bleReset() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
-  unsigned long start = millis();
-  while (!Serial && (millis() - start) < 2000) {
-    delay(10);
-  }
-#endif
   printBootInfo();
   ensureLittleFS();
   loadConfig();
@@ -2009,36 +1357,20 @@ void setup() {
   Serial.print(" SCL=");
   Serial.println(deviceConfig.i2cScl);
   applySensorMode();
-  applyUserIo();
   bleInit();
 }
 
 void loop() {
-  handleSerialCommands();
-  handleButtonInput();
   if (bleResetPending && (int32_t)(millis() - bleResetAt) >= 0) {
     bleResetPending = false;
     bleReset();
   }
 
   const uint32_t now = millis();
-  if (!serialDumpInProgress && now - lastBeat >= HEARTBEAT_MS) {
+  if (now - lastBeat >= HEARTBEAT_MS) {
     lastBeat = now;
     Serial.print("[ALIVE] ms=");
     Serial.println(now);
-  }
-
-  if (csvStreamActive && csvStreamLastActivityMs && (now - csvStreamLastActivityMs) > 5000) {
-    Serial.println("[CSV] Stream timeout, closing.");
-    endCsvStream();
-  }
-
-  if (csvExportInProgress && connectedCount == 0 && csvExportStartedAt) {
-    if (now - csvExportStartedAt > 5000) {
-      csvExportInProgress = false;
-      csvExportStartedAt = 0;
-      Serial.println("[CSV] Export timeout (no connection).");
-    }
   }
 
   if (now - lastScanMs >= RESCAN_INTERVAL_MS) {
@@ -2048,9 +1380,7 @@ void loop() {
     }
   }
 
-  if (!csvExportInProgress
-      && (connectedCount > 0 || deviceConfig.storeFlash)
-      && (now - lastSensorMs) >= sensorIntervalMs) {
+  if (connectedCount > 0 && (now - lastSensorMs) >= sensorIntervalMs) {
     lastSensorMs = now;
     const std::string sensor = normalizeSensor(deviceConfig.sensor);
     if (sensor == "i2c") {
@@ -2059,46 +1389,34 @@ void loop() {
       if (bmp280 && readBmp280(tempC, pressHpa)) {
         char addr[8];
         snprintf(addr, sizeof(addr), "0x%02X", bmpAddr);
-        if (connectedCount > 0) {
-          sendMetricPayload("bmp280", addr, "temperature", tempC, "pressure", pressHpa);
-        }
+        sendMetricPayload("bmp280", addr, "temperature", tempC, "pressure", pressHpa);
         flashLog(tempC, pressHpa);
       }
       if (ms5611 && readMs5611(tempC, pressHpa)) {
         char addr[8];
         snprintf(addr, sizeof(addr), "0x%02X", msAddr);
-        if (connectedCount > 0) {
-          sendMetricPayload("gy63", addr, "temperature", tempC, "pressure", pressHpa);
-        }
+        sendMetricPayload("gy63", addr, "temperature", tempC, "pressure", pressHpa);
         flashLog(tempC, pressHpa);
       }
     } else if (sensor == "analog" && deviceConfig.analogPin >= 0) {
       int raw = analogRead(deviceConfig.analogPin);
       float value = (float)raw;
-      if (connectedCount > 0) {
-        sendMetricPayload("analog", "", "generic", value, nullptr, 0.0f);
-      }
+      sendMetricPayload("analog", "", "generic", value, nullptr, 0.0f);
       flashLog(value, NAN);
     } else if (sensor == "digital" && deviceConfig.digitalPin >= 0) {
       int raw = digitalRead(deviceConfig.digitalPin);
       float value = (float)(raw ? 1 : 0);
-      if (connectedCount > 0) {
-        sendMetricPayload("digital", "", "generic", value, nullptr, 0.0f);
-      }
+      sendMetricPayload("digital", "", "generic", value, nullptr, 0.0f);
       flashLog(value, NAN);
     } else if (sensor == "onewire" && deviceConfig.onewirePin >= 0) {
       float value = 0.0f;
       if (readOneWire(value)) {
-        if (connectedCount > 0) {
-          sendMetricPayload("onewire", "", "temperature", value, nullptr, 0.0f);
-        }
+        sendMetricPayload("onewire", "", "temperature", value, nullptr, 0.0f);
         flashLog(value, NAN);
       }
     } else if (sensor == "random") {
       float value = (float)(random(0, 1000)) / 10.0f;
-      if (connectedCount > 0) {
-        sendMetricPayload("random", "", "generic", value, nullptr, 0.0f);
-      }
+      sendMetricPayload("random", "", "generic", value, nullptr, 0.0f);
       flashLog(value, NAN);
     }
   }
