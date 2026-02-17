@@ -8,12 +8,34 @@ const RECONNECT_BASE_DELAY = 1000;
 const RECONNECT_MAX_DELAY = 15000;
 const RECONNECT_MAX_ATTEMPTS = 6;
 
+const I2C_PIN_OPTIONS = [
+  { value: "auto", label: "Auto" },
+  { value: "8", label: "GPIO8" },
+  { value: "9", label: "GPIO9" },
+];
+
 const METRIC_PROFILES = {
   temperature: { label: "Temperature", unit: "°C", min: -10, max: 50 },
   pressure: { label: "Pression", unit: "hPa", min: 900, max: 1100 },
   humidity: { label: "Humidite", unit: "%", min: 0, max: 100 },
   generic: { label: "Valeur", unit: "", min: 0, max: 100 },
 };
+
+const RESERVED_KEYS = new Set([
+  "sensor",
+  "type",
+  "id",
+  "name",
+  "addr",
+  "i2c",
+  "metrics",
+  "values",
+  "data",
+  "profiles",
+  "profile",
+  "ranges",
+  "range",
+]);
 
 const devices = new Map();
 const encoder = new TextEncoder();
@@ -68,6 +90,204 @@ function switchTab(name) {
   document.querySelectorAll(".tab-panel").forEach((panel) => {
     panel.classList.toggle("active", panel.id === `tab-${name}`);
   });
+}
+
+function normalizeKey(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return null;
+  if (!/^[a-z0-9_.-]+$/.test(raw)) return null;
+  return raw;
+}
+
+function normalizeText(value, maxLen = 40) {
+  if (value === undefined || value === null) return "";
+  const text = String(value).trim();
+  if (!text) return "";
+  return text.slice(0, maxLen);
+}
+
+function toNumber(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function normalizePin(value) {
+  if (value === undefined || value === null) return null;
+  const raw = String(value).trim().toLowerCase();
+  if (!raw || raw === "auto") return null;
+  const num = Number(raw);
+  return Number.isInteger(num) ? num : null;
+}
+
+function fillPinOptions(select, current) {
+  select.innerHTML = "";
+  I2C_PIN_OPTIONS.forEach((option) => {
+    const opt = document.createElement("option");
+    opt.value = option.value;
+    opt.textContent = option.label;
+    if (String(option.value) === String(current)) {
+      opt.selected = true;
+    }
+    select.appendChild(opt);
+  });
+}
+
+function baseProfileForKey(key) {
+  const base = METRIC_PROFILES[key] || METRIC_PROFILES.generic || { label: key, unit: "", min: 0, max: 100 };
+  return {
+    label: base.label || key,
+    unit: base.unit || "",
+    min: Number.isFinite(base.min) ? base.min : 0,
+    max: Number.isFinite(base.max) ? base.max : 100,
+  };
+}
+
+function sanitizeProfile(update, base, key = "") {
+  const profile = { ...base };
+  const warnings = [];
+
+  const label = normalizeText(update.label, 50);
+  if (label) profile.label = label;
+  const unit = normalizeText(update.unit, 12);
+  if (unit || update.unit === "") profile.unit = unit;
+
+  const min = toNumber(update.min);
+  const max = toNumber(update.max);
+  if (min !== null) profile.min = min;
+  if (max !== null) profile.max = max;
+
+  if (Number.isFinite(profile.min) && Number.isFinite(profile.max) && profile.min >= profile.max) {
+    warnings.push(`Range invalide pour ${key || "metrique"} (min >= max).`);
+    profile.min = base.min;
+    profile.max = base.max;
+  }
+
+  return { profile, warnings };
+}
+
+function ensureMetricProfile(entry, key) {
+  if (!entry.metricProfiles) entry.metricProfiles = {};
+  if (!entry.metricProfiles[key]) entry.metricProfiles[key] = baseProfileForKey(key);
+  return entry.metricProfiles[key];
+}
+
+function applyProfileUpdate(entry, key, update) {
+  const base = ensureMetricProfile(entry, key);
+  const { profile } = sanitizeProfile(update, base, key);
+  entry.metricProfiles[key] = profile;
+  if (entry.metrics && entry.metrics[key]) {
+    entry.metrics[key].profile = profile;
+  }
+  return profile;
+}
+
+function safeDomId(value) {
+  return String(value || "device").replace(/[^a-z0-9_-]/gi, "");
+}
+
+function ensureConfigDraft(entry) {
+  if (!entry.configDraft) {
+    entry.configDraft = {
+      name: entry.name || "",
+      sda: "auto",
+      scl: "auto",
+      status: null,
+      touched: false,
+    };
+  }
+
+  const draft = entry.configDraft;
+  if (!draft.name && entry.name) draft.name = entry.name;
+  if (!draft.sda) draft.sda = "auto";
+  if (!draft.scl) draft.scl = "auto";
+
+  return draft;
+}
+
+function setDraftStatus(entry, type, message) {
+  const draft = ensureConfigDraft(entry);
+  draft.status = { type, message, ts: Date.now() };
+}
+
+function updateConfigStatus(entry) {
+  const domId = safeDomId(entry.id);
+  const statusEl = document.getElementById(`status-${domId}`);
+  if (!statusEl) return;
+  const draft = ensureConfigDraft(entry);
+  statusEl.textContent = draft.status ? draft.status.message : "";
+  statusEl.className = `config-status ${draft.status ? draft.status.type : ""}`;
+}
+
+function buildConfigPayload(entry, draft) {
+  const payload = {};
+  const warnings = [];
+
+  const name = normalizeText(draft.name, 32);
+  if (name) payload.name = name;
+
+  const sda = normalizePin(draft.sda);
+  const scl = normalizePin(draft.scl);
+  if (sda !== null || scl !== null) {
+    payload.i2c = {};
+    if (sda !== null) payload.i2c.sda = sda;
+    if (scl !== null) payload.i2c.scl = scl;
+  }
+
+  if (!payload.name) {
+    return { payload: null, warnings };
+  }
+
+  return { payload, warnings };
+}
+
+async function sendConfig(entry, draft, statusEl) {
+  if (!entry.connected || !entry.configChar) {
+    setDraftStatus(entry, "error", "ESP32 non connecte.");
+    if (statusEl) {
+      statusEl.textContent = entry.configDraft.status.message;
+      statusEl.className = "config-status error";
+    }
+    return;
+  }
+
+  const { payload, warnings } = buildConfigPayload(entry, draft);
+  if (!payload) {
+    setDraftStatus(entry, "error", "Aucune configuration valide a envoyer.");
+    if (statusEl) {
+      statusEl.textContent = entry.configDraft.status.message;
+      statusEl.className = "config-status error";
+    }
+    return;
+  }
+
+  try {
+    const encoded = encoder.encode(JSON.stringify(payload));
+    await entry.configChar.writeValue(encoded);
+
+    if (payload.name) {
+      entry.name = payload.name;
+      draft.name = payload.name;
+      draft.touched = false;
+    }
+
+    const warningSuffix = warnings.length ? ` (${warnings.length} avertissement(s))` : "";
+    const message = `Config envoyee${warningSuffix}.`;
+    setDraftStatus(entry, "ok", message);
+    if (statusEl) {
+      statusEl.textContent = message;
+      statusEl.className = "config-status ok";
+    }
+    if (warnings.length) console.warn("Config warnings", warnings);
+    renderAll();
+  } catch (err) {
+    console.error("Config write failed", err);
+    setDraftStatus(entry, "error", "Erreur lors de l'envoi BLE.");
+    if (statusEl) {
+      statusEl.textContent = entry.configDraft.status.message;
+      statusEl.className = "config-status error";
+    }
+  }
 }
 
 function getConnectedCount() {
@@ -152,6 +372,7 @@ async function connectWithDevice(device, entry) {
   record.reconnecting = false;
   record.autoReconnect = true;
   record.reconnectAttempts = 0;
+  if (!record.metricProfiles) record.metricProfiles = {};
   if (record.reconnectTimer) {
     clearTimeout(record.reconnectTimer);
     record.reconnectTimer = null;
@@ -203,9 +424,33 @@ function handleNotification(deviceId, valueView) {
 
   if (parsed.sensor) entry.sensor = parsed.sensor;
   if (parsed.addr) entry.address = parsed.addr;
+  if (parsed.name) {
+    entry.name = parsed.name;
+    if (entry.configDraft && !entry.configDraft.touched) {
+      entry.configDraft.name = parsed.name;
+    }
+  }
+  if (parsed.ack === "name") {
+    const type = parsed.status === "ok" ? "ok" : "error";
+    const message = parsed.message || (type === "ok" ? "Nom mis a jour." : "Erreur de configuration.");
+    setDraftStatus(entry, type, message);
+    updateConfigStatus(entry);
+  }
+  if (parsed.profiles && Object.keys(parsed.profiles).length > 0) {
+    Object.entries(parsed.profiles).forEach(([key, profile]) => {
+      const normalized = normalizeKey(key);
+      if (!normalized) return;
+      applyProfileUpdate(entry, normalized, profile);
+    });
+  }
 
   const keys = Object.keys(parsed.metrics);
-  if (keys.length === 0) return;
+  if (keys.length === 0) {
+    if (parsed.name || parsed.ack) {
+      renderAll();
+    }
+    return;
+  }
 
   keys.forEach((key) => {
     const value = parsed.metrics[key];
@@ -228,57 +473,154 @@ function decodeValue(view) {
 function parsePayload(raw) {
   let sensor = null;
   let addr = null;
+  let name = null;
+  let ack = null;
+  let status = null;
+  let message = null;
   const metrics = {};
+  const profiles = {};
 
-  if (!raw) return { sensor, addr, metrics };
+  if (!raw) return { sensor, addr, name, ack, status, message, metrics, profiles };
 
   if (raw.startsWith("{")) {
     try {
       const obj = JSON.parse(raw);
       if (obj.sensor) sensor = String(obj.sensor).toLowerCase();
       if (obj.type) sensor = String(obj.type).toLowerCase();
+      if (obj.name) name = String(obj.name);
       if (obj.addr) addr = String(obj.addr);
+      if (obj.i2c) addr = String(obj.i2c);
+      if (obj.ack) ack = String(obj.ack).toLowerCase();
+      if (obj.status) status = String(obj.status).toLowerCase();
+      if (obj.message) message = String(obj.message);
+      if (obj.msg && !message) message = String(obj.msg);
 
-      if (obj.temperature !== undefined) metrics.temperature = Number(obj.temperature);
-      if (obj.temp !== undefined) metrics.temperature = Number(obj.temp);
-      if (obj.pressure !== undefined) metrics.pressure = Number(obj.pressure);
-      if (obj.press !== undefined) metrics.pressure = Number(obj.press);
-      if (obj.humidity !== undefined) metrics.humidity = Number(obj.humidity);
-      if (obj.value !== undefined) metrics.generic = Number(obj.value);
+      const metricSource = obj.metrics || obj.values || obj.data;
+      if (metricSource && typeof metricSource === "object") {
+        Object.entries(metricSource).forEach(([rawKey, value]) => {
+          const key = normalizeKey(rawKey);
+          const num = toNumber(value);
+          if (!key || num === null) return;
+          metrics[key] = num;
+        });
+      } else {
+        if (obj.temperature !== undefined) metrics.temperature = Number(obj.temperature);
+        if (obj.temp !== undefined) metrics.temperature = Number(obj.temp);
+        if (obj.pressure !== undefined) metrics.pressure = Number(obj.pressure);
+        if (obj.press !== undefined) metrics.pressure = Number(obj.press);
+        if (obj.humidity !== undefined) metrics.humidity = Number(obj.humidity);
+        if (obj.value !== undefined) metrics.generic = Number(obj.value);
 
-      return { sensor, addr, metrics };
+        Object.entries(obj).forEach(([rawKey, value]) => {
+          const key = normalizeKey(rawKey);
+          if (!key || RESERVED_KEYS.has(key)) return;
+          const num = toNumber(value);
+          if (num === null) return;
+          metrics[key] = num;
+        });
+      }
+
+      const profileSource = obj.profiles || obj.profile || obj.metricProfiles || obj.metric_profiles;
+      if (profileSource && typeof profileSource === "object") {
+        Object.entries(profileSource).forEach(([rawKey, value]) => {
+          const key = normalizeKey(rawKey);
+          if (!key || !value || typeof value !== "object") return;
+          profiles[key] = profiles[key] || {};
+          if (value.label !== undefined) profiles[key].label = value.label;
+          if (value.unit !== undefined) profiles[key].unit = value.unit;
+          if (value.min !== undefined) profiles[key].min = value.min;
+          if (value.max !== undefined) profiles[key].max = value.max;
+        });
+      }
+
+      const ranges = obj.ranges || obj.range;
+      if (ranges && typeof ranges === "object") {
+        Object.entries(ranges).forEach(([rawKey, value]) => {
+          const key = normalizeKey(rawKey);
+          if (!key) return;
+          profiles[key] = profiles[key] || {};
+          if (Array.isArray(value) && value.length >= 2) {
+            profiles[key].min = value[0];
+            profiles[key].max = value[1];
+          } else if (value && typeof value === "object") {
+            if (value.min !== undefined) profiles[key].min = value.min;
+            if (value.max !== undefined) profiles[key].max = value.max;
+          }
+        });
+      }
+
+      return { sensor, addr, name, ack, status, message, metrics, profiles };
     } catch (err) {
       // ignore
     }
   }
 
-  const sensorMatch = raw.match(/"?(?:sensor|type|id)"?\s*[:=]\s*"?([a-z0-9_-]+)"?/i);
-  if (sensorMatch) {
-    sensor = sensorMatch[1].toLowerCase();
-  }
-
-  const addrMatch = raw.match(/"?(?:addr|i2c)"?\s*[:=]\s*"?(0x[0-9a-f]+)"?/i);
-  if (addrMatch) {
-    addr = addrMatch[1].toLowerCase();
-  }
-
   const pairs = raw.split(/[;,\n]+/);
   pairs.forEach((part) => {
-    const kv = part.match(/^\s*"?([a-z0-9_-]+)"?\s*[:=]\s*(-?\d+(?:\.\d+)?)/i);
+    const kv = part.match(/^\s*"?([a-z0-9_.-]+)"?\s*[:=]\s*"?([^"]+?)"?\s*$/i);
     if (!kv) return;
-    const key = kv[1].toLowerCase();
-    const value = Number(kv[2]);
-    metrics[key] = value;
+    const rawKey = kv[1];
+    const rawValue = kv[2].trim();
+    const key = normalizeKey(rawKey);
+    if (!key) return;
+
+    if (key === "sensor" || key === "type" || key === "id") {
+      sensor = rawValue.toLowerCase();
+      return;
+    }
+    if (key === "name") {
+      name = rawValue;
+      return;
+    }
+    if (key === "addr" || key === "i2c") {
+      addr = rawValue.toLowerCase();
+      return;
+    }
+    if (key === "ack") {
+      ack = rawValue.toLowerCase();
+      return;
+    }
+    if (key === "status") {
+      status = rawValue.toLowerCase();
+      return;
+    }
+    if (key === "message" || key === "msg") {
+      message = rawValue;
+      return;
+    }
+
+    const profileMatch = key.match(/^(?:profile|profil|range|ranges)\.([a-z0-9_.-]+)\.(label|unit|min|max)$/);
+    if (profileMatch) {
+      const profileKey = normalizeKey(profileMatch[1]);
+      const field = profileMatch[2];
+      if (!profileKey) return;
+      profiles[profileKey] = profiles[profileKey] || {};
+      if (field === "min" || field === "max") {
+        const num = toNumber(rawValue);
+        if (num !== null) profiles[profileKey][field] = num;
+      } else {
+        profiles[profileKey][field] = rawValue;
+      }
+      return;
+    }
+
+    const metricMatch = key.match(/^(?:metric|metrics|value|values|data)\.([a-z0-9_.-]+)$/);
+    const metricKey = metricMatch ? normalizeKey(metricMatch[1]) : key;
+    if (!metricKey || RESERVED_KEYS.has(metricKey)) return;
+
+    const value = toNumber(rawValue);
+    if (value === null) return;
+    metrics[metricKey] = value;
   });
 
-  return { sensor, addr, metrics };
+  return { sensor, addr, name, ack, status, message, metrics, profiles };
 }
 
 function ensureMetric(entry, key) {
   if (!entry.metrics) entry.metrics = {};
   if (!entry.metricOrder) entry.metricOrder = [];
   if (!entry.metrics[key]) {
-    const profile = METRIC_PROFILES[key] || { label: key, unit: "", min: 0, max: 100 };
+    const profile = ensureMetricProfile(entry, key);
     entry.metrics[key] = { key, profile, values: [], latest: null };
     entry.metricOrder.push(key);
   }
@@ -287,7 +629,13 @@ function ensureMetric(entry, key) {
 
 function renderAll() {
   const list = Array.from(devices.values());
-  renderConfig(list);
+  const active = document.activeElement;
+  const editingConfig = active
+    && configList.contains(active)
+    && (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.tagName === "SELECT");
+  if (!editingConfig) {
+    renderConfig(list);
+  }
   renderViz(list);
   updateControls();
 }
@@ -302,6 +650,9 @@ function renderConfig(list) {
   configEmpty.style.display = "none";
 
   list.forEach((entry) => {
+    const draft = ensureConfigDraft(entry);
+
+    const domId = safeDomId(entry.id);
     const card = document.createElement("div");
     card.className = "device-card";
 
@@ -314,27 +665,96 @@ function renderConfig(list) {
 
     const meta = document.createElement("div");
     meta.className = "config-meta";
+    const sensorLabel = entry.sensor || "Inconnu";
+    const addrLabel = entry.address || "--";
     meta.innerHTML = `
-      <div><strong>Capteur:</strong> ${entry.sensor || "Inconnu"}</div>
-      <div><strong>Adresse:</strong> ${entry.address || "--"}</div>
+      <div><strong>Capteur:</strong> ${sensorLabel}</div>
+      <div><strong>Adresse:</strong> ${addrLabel}</div>
     `;
 
-    const chips = document.createElement("div");
-    chips.className = "metric-chips";
-    const keys = entry.metricOrder || [];
-    if (keys.length > 0) {
-      keys.forEach((key) => {
-        const chip = document.createElement("span");
-        const profile = (entry.metrics && entry.metrics[key]) ? entry.metrics[key].profile : null;
-        chip.className = "chip";
-        chip.textContent = profile ? profile.label : key;
-        chips.appendChild(chip);
-      });
-    }
+    const form = document.createElement("form");
+    form.className = "config-form";
+
+    const grid = document.createElement("div");
+    grid.className = "config-grid";
+
+    const nameField = document.createElement("div");
+    nameField.className = "field";
+    const nameLabelEl = document.createElement("label");
+    nameLabelEl.setAttribute("for", `name-${domId}`);
+    nameLabelEl.textContent = "Nom BLE";
+    const nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.id = `name-${domId}`;
+    nameInput.placeholder = "ESP32-Lab-01";
+    nameInput.value = draft.name || "";
+    nameInput.addEventListener("input", (event) => {
+      draft.name = event.target.value;
+      draft.touched = true;
+    });
+    nameField.appendChild(nameLabelEl);
+    nameField.appendChild(nameInput);
+
+    grid.appendChild(nameField);
+
+    const sdaField = document.createElement("div");
+    sdaField.className = "field";
+    const sdaLabelEl = document.createElement("label");
+    sdaLabelEl.setAttribute("for", `sda-${domId}`);
+    sdaLabelEl.textContent = "Pin SDA";
+    const sdaSelect = document.createElement("select");
+    sdaSelect.id = `sda-${domId}`;
+    fillPinOptions(sdaSelect, draft.sda);
+    sdaSelect.addEventListener("change", (event) => {
+      draft.sda = event.target.value;
+      draft.touched = true;
+    });
+    sdaField.appendChild(sdaLabelEl);
+    sdaField.appendChild(sdaSelect);
+
+    const sclField = document.createElement("div");
+    sclField.className = "field";
+    const sclLabelEl = document.createElement("label");
+    sclLabelEl.setAttribute("for", `scl-${domId}`);
+    sclLabelEl.textContent = "Pin SCL";
+    const sclSelect = document.createElement("select");
+    sclSelect.id = `scl-${domId}`;
+    fillPinOptions(sclSelect, draft.scl);
+    sclSelect.addEventListener("change", (event) => {
+      draft.scl = event.target.value;
+      draft.touched = true;
+    });
+    sclField.appendChild(sclLabelEl);
+    sclField.appendChild(sclSelect);
+
+    grid.appendChild(sdaField);
+    grid.appendChild(sclField);
+
+    const actions = document.createElement("div");
+    actions.className = "config-actions";
+    const sendBtn = document.createElement("button");
+    sendBtn.type = "submit";
+    sendBtn.className = "btn small primary";
+    sendBtn.textContent = "Envoyer la config";
+
+    actions.appendChild(sendBtn);
+
+    const status = document.createElement("div");
+    status.id = `status-${domId}`;
+    status.className = `config-status ${draft.status ? draft.status.type : ""}`;
+    status.textContent = draft.status ? draft.status.message : "";
+
+    form.appendChild(grid);
+    form.appendChild(actions);
+    form.appendChild(status);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      sendConfig(entry, draft, status);
+    });
 
     card.appendChild(title);
     card.appendChild(meta);
-    if (chips.childNodes.length > 0) card.appendChild(chips);
+    card.appendChild(form);
     configList.appendChild(card);
   });
 }
@@ -469,9 +889,12 @@ function drawGauge(canvas, value, profile) {
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  const min = profile.min;
-  const max = profile.max;
-  const ratio = Number.isFinite(value) ? Math.min(Math.max((value - min) / (max - min || 1), 0), 1) : 0;
+  const min = Number.isFinite(profile.min) ? profile.min : 0;
+  const max = Number.isFinite(profile.max) ? profile.max : 100;
+  const safeMax = min >= max ? min + 1 : max;
+  const ratio = Number.isFinite(value)
+    ? Math.min(Math.max((value - min) / (safeMax - min || 1), 0), 1)
+    : 0;
 
   const center = { x: canvas.width / 2, y: canvas.height / 2 };
   const radius = canvas.width / 2 - 12;
@@ -510,7 +933,7 @@ function drawGauge(canvas, value, profile) {
   ctx.fillStyle = "#5c5a55";
   ctx.font = "11px 'IBM Plex Mono', monospace";
   ctx.fillText(min, 8, canvas.height - 8);
-  ctx.fillText(max, canvas.width - 26, canvas.height - 8);
+  ctx.fillText(safeMax, canvas.width - 26, canvas.height - 8);
 }
 
 updateControls();
