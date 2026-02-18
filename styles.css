@@ -221,7 +221,7 @@ h1 {
 
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -648,11 +648,21 @@ input[type="number"] {
 }
 
 @media (max-width: 720px) {
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+
   .chart-wrap {
     grid-template-columns: 1fr;
   }
 
   .hero {
     padding-top: 30px;
+  }
+}
+
+@media (min-width: 721px) and (max-width: 1180px) {
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

@@ -16,6 +16,12 @@
 #include <ctype.h>
 #include <time.h>
 
+#if !defined(BME68X_DO_NOT_USE_FPU)
+const uint8_t bsec_config_iaq[] = {
+  #include "config/bme680/bme680_iaq_33v_3s_4d/bsec_iaq.txt"
+};
+#endif
+
 #if defined(ARDUINO_ARCH_ESP32)
 #include "esp_system.h"
 #include "esp_chip_info.h"
@@ -37,6 +43,8 @@ static const uint32_t HEARTBEAT_MS = 1000;
 static const uint32_t RESCAN_INTERVAL_MS = 5000;
 static const uint8_t I2C_ADDR_BMP280_A = 0x76;
 static const uint8_t I2C_ADDR_BMP280_B = 0x77;
+static const uint8_t I2C_ADDR_BME680_A = 0x76;
+static const uint8_t I2C_ADDR_BME680_B = 0x77;
 static const uint8_t I2C_ADDR_MS5611_A = 0x77;
 static const uint8_t I2C_ADDR_MS5611_B = 0x76;
 static const uint8_t REG_CHIP_ID = 0xD0;
@@ -82,6 +90,7 @@ static uint32_t csvStreamLastActivityMs = 0;
 static const uint8_t CSV_ACK_WINDOW = 1;
 static bool serialDumpInProgress = false;
 static CsvLogger csvLogger(LittleFS, LOG_PATH, LOG_HEADER);
+static bool immediateSamplePending = false;
 
 #ifndef USE_COMPACT_METRICS
 #define USE_COMPACT_METRICS 1
@@ -96,6 +105,7 @@ static DHT *dht = nullptr;
 static uint8_t bmpAddr = 0;
 static uint8_t bmeAddr = 0;
 static uint8_t msAddr = 0;
+static int64_t lastBsecTimestampNs = 0;
 static Preferences prefs;
 static bool prefsReady = false;
 static uint32_t sensorIntervalMs = 1000;
@@ -119,6 +129,9 @@ struct Bme680Reading {
   float breathVoc = NAN;
   float iaqAccuracy = NAN;
 };
+
+static Bme680Reading bme680Latest;
+static bool bme680LatestValid = false;
 
 enum DigitalSensorType {
   DIGITAL_SENSOR_NONE = 0,
@@ -203,9 +216,30 @@ static void sendNextCsvBlock();
 static void sendCsvFromFlash();
 static void handleSerialCommands();
 static void dumpCsvToSerial();
+static void acquireAndPublishSample();
+static bool readBmp280(float &tempC, float &pressHpa);
+static bool readMs5611(float &tempC, float &pressHpa);
+static bool readBme680(Bme680Reading &reading);
+static bool readOneWire(float &tempC);
+static void sendMetricPayload(const char *sensor, const char *addr, const char *key1, float v1, const char *key2, float v2);
 static void clearDigitalSensor();
 static void detectDigitalSensor();
 static bool readDigitalSensor(float &v1, float &v2, bool &paired, const char *&sensorName);
+static std::string normalizeSensor(const std::string &input);
+static void bsecBme680Callback(const bme68xData data, const bsecOutputs outputs, const Bsec2 bsec);
+static void scheduleImmediateSensorPush();
+
+static void scheduleImmediateSensorPush() {
+  const uint32_t now = millis();
+  // Force loop condition (now - lastSensorMs) >= sensorIntervalMs on next iteration.
+  lastSensorMs = now - sensorIntervalMs;
+  immediateSamplePending = true;
+  if (sensorInitPending) sensorInitAt = now;
+  if (normalizeSensor(deviceConfig.sensor) == "i2c") {
+    i2cScanPending = true;
+    lastScanMs = 0;
+  }
+}
 
 static std::string trimCopy(const std::string &input) {
   size_t start = 0;
@@ -806,9 +840,10 @@ static void sendProfilesForSensor(const std::string &sensor) {
     addProfile("temperature", "Temperature", "C", -10, 50);
     addProfile("pressure", "Pression", "hPa", 900, 1100);
     addProfile("humidity", "Humidite", "%", 0, 100);
-    addProfile("gas", "Gaz", "KOhm", 0, 500);
     addProfile("iaq", "IAQ", "", 0, 500);
     addProfile("iaq_accuracy", "Precision IAQ", "", 0, 3);
+    addProfile("co2eq", "eCO2", "ppm", 350, 10000);
+    addProfile("breath_voc", "VOC", "ppm", 0, 10);
   } else if (sensor == "digital") {
     addProfile("temperature", "Temperature", "C", -10, 80);
     addProfile("humidity", "Humidite", "%", 0, 100);
@@ -1316,6 +1351,95 @@ static bool readDigitalSensor(float &v1, float &v2, bool &paired, const char *&s
   return true;
 }
 
+static void acquireAndPublishSample() {
+  const std::string sensor = normalizeSensor(deviceConfig.sensor);
+  if (sensor == "i2c") {
+    float tempC = 0.0f;
+    float pressHpa = 0.0f;
+    Bme680Reading bme;
+    if (bme680 && readBme680(bme)) {
+      char addr[8];
+      snprintf(addr, sizeof(addr), "0x%02X", bmeAddr);
+      if (connectedCount > 0) {
+        if (isfinite(bme.tempC) && isfinite(bme.pressHpa)) {
+          sendMetricPayload("bme680", addr, "temperature", bme.tempC, "pressure", bme.pressHpa);
+        }
+        if (isfinite(bme.humPct)) {
+          sendMetricPayload("bme680", addr, "humidity", bme.humPct, nullptr, 0.0f);
+        }
+        if (isfinite(bme.iaq)) {
+          if (isfinite(bme.iaqAccuracy)) {
+            sendMetricPayload("bme680", addr, "iaq", bme.iaq, "iaq_accuracy", bme.iaqAccuracy);
+          } else {
+            sendMetricPayload("bme680", addr, "iaq", bme.iaq, nullptr, 0.0f);
+          }
+        }
+        if (isfinite(bme.co2eq)) {
+          sendMetricPayload("bme680", addr, "co2eq", bme.co2eq, nullptr, 0.0f);
+        }
+        if (isfinite(bme.breathVoc)) {
+          sendMetricPayload("bme680", addr, "breath_voc", bme.breathVoc, nullptr, 0.0f);
+        }
+      }
+      if (isfinite(bme.tempC) || isfinite(bme.humPct)) {
+        flashLog(bme.tempC, bme.humPct);
+      }
+    }
+    if (bmp280 && readBmp280(tempC, pressHpa)) {
+      char addr[8];
+      snprintf(addr, sizeof(addr), "0x%02X", bmpAddr);
+      if (connectedCount > 0) {
+        sendMetricPayload("bmp280", addr, "temperature", tempC, "pressure", pressHpa);
+      }
+      flashLog(tempC, pressHpa);
+    }
+    if (ms5611 && readMs5611(tempC, pressHpa)) {
+      char addr[8];
+      snprintf(addr, sizeof(addr), "0x%02X", msAddr);
+      if (connectedCount > 0) {
+        sendMetricPayload("gy63", addr, "temperature", tempC, "pressure", pressHpa);
+      }
+      flashLog(tempC, pressHpa);
+    }
+  } else if (sensor == "analog" && deviceConfig.analogPin >= 0) {
+    int raw = analogRead(deviceConfig.analogPin);
+    float value = (float)raw;
+    if (connectedCount > 0) {
+      sendMetricPayload("analog", "", "generic", value, nullptr, 0.0f);
+    }
+    flashLog(value, NAN);
+  } else if (sensor == "digital" && deviceConfig.digitalPin >= 0) {
+    float v1 = NAN;
+    float v2 = NAN;
+    bool paired = false;
+    const char *sensorName = "digital";
+    if (readDigitalSensor(v1, v2, paired, sensorName)) {
+      if (connectedCount > 0) {
+        if (paired) {
+          sendMetricPayload(sensorName, "", "temperature", v1, "humidity", v2);
+        } else {
+          sendMetricPayload(sensorName, "", "generic", v1, nullptr, 0.0f);
+        }
+      }
+      flashLog(v1, v2);
+    }
+  } else if (sensor == "onewire" && deviceConfig.onewirePin >= 0) {
+    float value = 0.0f;
+    if (readOneWire(value)) {
+      if (connectedCount > 0) {
+        sendMetricPayload("ds18b20", "", "temperature", value, nullptr, 0.0f);
+      }
+      flashLog(value, NAN);
+    }
+  } else if (sensor == "random") {
+    float value = (float)(random(0, 1000)) / 10.0f;
+    if (connectedCount > 0) {
+      sendMetricPayload("random", "", "generic", value, nullptr, 0.0f);
+    }
+    flashLog(value, NAN);
+  }
+}
+
 static void applySensorMode() {
   const std::string sensor = normalizeSensor(deviceConfig.sensor);
   if (sensor == "i2c") {
@@ -1403,6 +1527,7 @@ static bool applyConfigUpdate(const ConfigUpdate &update) {
   bool changed = false;
   bool modeTouched = false;
   bool ioTouched = false;
+  bool frequencyChanged = false;
 
   if (update.hasName) {
     std::string applied;
@@ -1448,8 +1573,12 @@ static bool applyConfigUpdate(const ConfigUpdate &update) {
     ioTouched = true;
   }
   if (update.hasFrequency) {
-    deviceConfig.frequencyMs = update.frequencyMs ? update.frequencyMs : 1000;
-    sensorIntervalMs = deviceConfig.frequencyMs;
+    const uint32_t nextFreq = update.frequencyMs ? update.frequencyMs : 1000;
+    if (deviceConfig.frequencyMs != nextFreq) {
+      frequencyChanged = true;
+    }
+    deviceConfig.frequencyMs = nextFreq;
+    sensorIntervalMs = nextFreq;
     changed = true;
   }
   if (update.hasStoreFlash) {
@@ -1467,6 +1596,12 @@ static bool applyConfigUpdate(const ConfigUpdate &update) {
   if (ioTouched) {
     applyUserIo();
   }
+  if (frequencyChanged) {
+    // Apply new cadence immediately.
+    scheduleImmediateSensorPush();
+    Serial.print("[SENSOR] Frequency updated ms=");
+    Serial.println((unsigned long)sensorIntervalMs);
+  }
 
   if (changed) saveConfig();
   return changed;
@@ -1478,6 +1613,9 @@ static ConfigUpdate parseConfigUpdate(const std::string &value) {
   if (trimmed.empty()) return update;
 
   if (!trimmed.empty() && trimmed.front() == '{') {
+    std::string configObj;
+    const bool hasConfigObj = extractJsonObjectField(trimmed, "config", configObj);
+
     std::string action;
     if (extractJsonStringField(trimmed, "action", action)) {
       update.hasAction = true;
@@ -1519,10 +1657,16 @@ static ConfigUpdate parseConfigUpdate(const std::string &value) {
       update.hasCsvAck = got;
     }
 
-    if (extractJsonStringField(trimmed, "name", update.name)) update.hasName = true;
+    if (extractJsonStringField(trimmed, "name", update.name)
+        || (hasConfigObj && extractJsonStringField(configObj, "name", update.name))) {
+      update.hasName = true;
+    }
 
     std::string sensor;
-    if (extractJsonStringField(trimmed, "sensor", sensor) || extractJsonStringField(trimmed, "type", sensor)) {
+    if (extractJsonStringField(trimmed, "sensor", sensor)
+        || extractJsonStringField(trimmed, "type", sensor)
+        || (hasConfigObj && extractJsonStringField(configObj, "sensor", sensor))
+        || (hasConfigObj && extractJsonStringField(configObj, "type", sensor))) {
       update.hasSensor = true;
       update.sensor = sensor;
     }
@@ -1531,7 +1675,11 @@ static ConfigUpdate parseConfigUpdate(const std::string &value) {
     if (extractJsonNumberFieldU32(trimmed, "frequency", freq)
         || extractJsonNumberFieldU32(trimmed, "freq", freq)
         || extractJsonNumberFieldU32(trimmed, "interval", freq)
-        || extractJsonNumberFieldU32(trimmed, "period", freq)) {
+        || extractJsonNumberFieldU32(trimmed, "period", freq)
+        || (hasConfigObj && extractJsonNumberFieldU32(configObj, "frequency", freq))
+        || (hasConfigObj && extractJsonNumberFieldU32(configObj, "freq", freq))
+        || (hasConfigObj && extractJsonNumberFieldU32(configObj, "interval", freq))
+        || (hasConfigObj && extractJsonNumberFieldU32(configObj, "period", freq))) {
       update.hasFrequency = true;
       update.frequencyMs = freq;
     }
@@ -1540,7 +1688,11 @@ static ConfigUpdate parseConfigUpdate(const std::string &value) {
     if (extractJsonBoolField(trimmed, "store_flash", storeFlash)
         || extractJsonBoolField(trimmed, "storeFlash", storeFlash)
         || extractJsonBoolField(trimmed, "save", storeFlash)
-        || extractJsonBoolField(trimmed, "flash", storeFlash)) {
+        || extractJsonBoolField(trimmed, "flash", storeFlash)
+        || (hasConfigObj && extractJsonBoolField(configObj, "store_flash", storeFlash))
+        || (hasConfigObj && extractJsonBoolField(configObj, "storeFlash", storeFlash))
+        || (hasConfigObj && extractJsonBoolField(configObj, "save", storeFlash))
+        || (hasConfigObj && extractJsonBoolField(configObj, "flash", storeFlash))) {
       update.hasStoreFlash = true;
       update.storeFlash = storeFlash;
     }
@@ -1705,17 +1857,28 @@ static bool i2cReadByte(uint8_t addr, uint8_t reg, uint8_t &value) {
 static void i2cScan() {
   Serial.println("[I2C] Scan...");
   int found = 0;
+  String foundList;
   for (uint8_t addr = 0x03; addr < 0x78; addr++) {
     if (i2cPresent(addr)) {
       Serial.print("[I2C] Found 0x");
       if (addr < 16) Serial.print("0");
       Serial.println(addr, HEX);
+      if (foundList.length() > 0) foundList += ", ";
+      foundList += "0x";
+      if (addr < 16) foundList += "0";
+      foundList += String(addr, HEX);
       found++;
     }
     if ((addr & 0x07) == 0) delay(1);
   }
   if (found == 0) {
     Serial.println("[I2C] Aucun peripherique detecte");
+  } else {
+    foundList.toUpperCase();
+    Serial.print("[I2C] Adresses detectees (");
+    Serial.print(found);
+    Serial.print("): ");
+    Serial.println(foundList);
   }
 }
 
@@ -1735,6 +1898,9 @@ static void clearSensors() {
   bmpAddr = 0;
   bmeAddr = 0;
   msAddr = 0;
+  lastBsecTimestampNs = 0;
+  bme680Latest = Bme680Reading();
+  bme680LatestValid = false;
 }
 
 static bool tryMs5611(uint8_t addr) {
@@ -1796,25 +1962,34 @@ static bool tryBme680(uint8_t addr) {
   if (addr < 16) Serial.print("0");
   Serial.println(addr, HEX);
   if (bme680->begin(addr, Wire)) {
+    if (!bme680->setConfig(bsec_config_iaq)) {
+      Serial.print("[BSEC] setConfig failed status=");
+      Serial.println((int)bme680->status);
+      delete bme680;
+      bme680 = nullptr;
+      return false;
+    }
     bsecSensor sensorList[] = {
-      BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
-      BSEC_OUTPUT_RAW_PRESSURE,
-      BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
-      BSEC_OUTPUT_RAW_GAS,
       BSEC_OUTPUT_IAQ,
-      BSEC_OUTPUT_STATIC_IAQ,
+      BSEC_OUTPUT_RAW_PRESSURE,
       BSEC_OUTPUT_CO2_EQUIVALENT,
       BSEC_OUTPUT_BREATH_VOC_EQUIVALENT
     };
     bme680->setTemperatureOffset(TEMP_OFFSET_LP);
     delay(1);
-    if (!bme680->updateSubscription(sensorList, ARRAY_LEN(sensorList), BME680_SAMPLE_RATE)) {
+    bool subOk = bme680->updateSubscription(sensorList, ARRAY_LEN(sensorList), BME680_SAMPLE_RATE);
+    if (!subOk && bme680->status < BSEC_OK) {
       Serial.print("[BSEC] updateSubscription failed status=");
       Serial.println((int)bme680->status);
       delete bme680;
       bme680 = nullptr;
       return false;
     }
+    if (!subOk && bme680->status > BSEC_OK) {
+      Serial.print("[BSEC] updateSubscription warning status=");
+      Serial.println((int)bme680->status);
+    }
+    bme680->attachCallback(bsecBme680Callback);
     bmeAddr = addr;
     Serial.print("[I2C] BME680 detecte a 0x");
     if (addr < 16) Serial.print("0");
@@ -1842,9 +2017,9 @@ static void scanSensors() {
   delay(1);
 
   // Then try BME680 on both possible addresses
-  tryBme680(I2C_ADDR_BMP280_A);
+  tryBme680(I2C_ADDR_BME680_A);
   delay(1);
-  tryBme680(I2C_ADDR_BMP280_B);
+  tryBme680(I2C_ADDR_BME680_B);
   delay(1);
 
   // Then try BMP280 on both addresses if not already taken by MS5611
@@ -1873,6 +2048,41 @@ static bool readMs5611(float &tempC, float &pressHpa) {
   return isfinite(tempC) && isfinite(pressHpa);
 }
 
+static void bsecBme680Callback(const bme68xData data, const bsecOutputs outputs, const Bsec2 bsec) {
+  (void)bsec;
+
+  // Read raw environmental values from Bosch BME68x driver data.
+  float t = data.temperature;
+  float h = data.humidity;
+  float p = data.pressure;
+  if (t > 200.0f || t < -100.0f) t *= 0.01f;
+  if (h > 100.0f) h *= 0.001f;
+  if (p > 2000.0f) p *= 0.01f;
+  bme680Latest.tempC = t;
+  bme680Latest.humPct = h;
+  bme680Latest.pressHpa = p;
+  bme680Latest.gasKOhm = data.gas_resistance / 1000.0f;
+  bme680LatestValid = true;
+
+  int64_t latestTs = 0;
+  for (uint8_t i = 0; i < outputs.nOutputs; i++) {
+    const bsecData out = outputs.output[i];
+    if (out.time_stamp > latestTs) latestTs = out.time_stamp;
+    if (out.sensor_id == BSEC_OUTPUT_IAQ) {
+      bme680Latest.iaq = out.signal;
+      bme680Latest.iaqAccuracy = (float)out.accuracy;
+    } else if (out.sensor_id == BSEC_OUTPUT_RAW_PRESSURE) {
+      // Raw pressure from BSEC may be Pa or hPa depending on build/config.
+      bme680Latest.pressHpa = (out.signal > 2000.0f) ? (out.signal / 100.0f) : out.signal;
+    } else if (out.sensor_id == BSEC_OUTPUT_CO2_EQUIVALENT) {
+      bme680Latest.co2eq = out.signal;
+    } else if (out.sensor_id == BSEC_OUTPUT_BREATH_VOC_EQUIVALENT) {
+      bme680Latest.breathVoc = out.signal;
+    }
+  }
+  if (latestTs > 0) lastBsecTimestampNs = latestTs;
+}
+
 static bool readBme680(Bme680Reading &reading) {
   if (!bme680) return false;
   if (!bme680->run()) {
@@ -1884,45 +2094,9 @@ static bool readBme680(Bme680Reading &reading) {
     }
     return false;
   }
-  const bsecOutputs *outputs = bme680->getOutputs();
-  if (!outputs || outputs->nOutputs == 0) return false;
-
-  bool hasCore = false;
-  for (uint8_t i = 0; i < outputs->nOutputs; i++) {
-    const bsecData out = outputs->output[i];
-    switch (out.sensor_id) {
-      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE:
-        reading.tempC = out.signal;
-        break;
-      case BSEC_OUTPUT_RAW_PRESSURE:
-        reading.pressHpa = out.signal / 100.0f;
-        break;
-      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:
-        reading.humPct = out.signal;
-        break;
-      case BSEC_OUTPUT_RAW_GAS:
-        reading.gasKOhm = out.signal / 1000.0f;
-        break;
-      case BSEC_OUTPUT_IAQ:
-        reading.iaq = out.signal;
-        reading.iaqAccuracy = (float)out.accuracy;
-        break;
-      case BSEC_OUTPUT_STATIC_IAQ:
-        reading.staticIaq = out.signal;
-        break;
-      case BSEC_OUTPUT_CO2_EQUIVALENT:
-        reading.co2eq = out.signal;
-        break;
-      case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
-        reading.breathVoc = out.signal;
-        break;
-      default:
-        break;
-    }
-  }
-  hasCore = isfinite(reading.tempC) && isfinite(reading.pressHpa)
-    && isfinite(reading.humPct) && isfinite(reading.gasKOhm);
-  return hasCore;
+  if (!bme680LatestValid) return false;
+  reading = bme680Latest;
+  return isfinite(reading.tempC) || isfinite(reading.humPct) || isfinite(reading.pressHpa) || isfinite(reading.iaq);
 }
 
 static bool readOneWire(float &tempC) {
@@ -1943,8 +2117,8 @@ static const char *compactMetricKey(const char *key) {
   if (strcmp(key, "gas") == 0) return "g";
   if (strcmp(key, "iaq") == 0) return "iaq";
   if (strcmp(key, "iaq_accuracy") == 0) return "ia";
-  if (strcmp(key, "co2eq") == 0) return "co2";
-  if (strcmp(key, "breath_voc") == 0) return "voc";
+  if (strcmp(key, "co2eq") == 0) return "co2eq";
+  if (strcmp(key, "breath_voc") == 0) return "breath_voc";
   return key;
 }
 
@@ -1962,21 +2136,21 @@ static void sendMetricPayload(const char *sensor, const char *addr, const char *
   if (key2) {
     if (haveTs) {
       snprintf(payload, sizeof(payload),
-               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f,\"%s\":%.2f},\"ts\":\"%s\"}",
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.3f,\"%s\":%.3f},\"ts\":\"%s\"}",
                sensor ? sensor : "", k1, v1, k2, v2, tsBuf);
     } else {
       snprintf(payload, sizeof(payload),
-               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f,\"%s\":%.2f}}",
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.3f,\"%s\":%.3f}}",
                sensor ? sensor : "", k1, v1, k2, v2);
     }
   } else {
     if (haveTs) {
       snprintf(payload, sizeof(payload),
-               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f},\"ts\":\"%s\"}",
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.3f},\"ts\":\"%s\"}",
                sensor ? sensor : "", k1, v1, tsBuf);
     } else {
       snprintf(payload, sizeof(payload),
-               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f}}",
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.3f}}",
                sensor ? sensor : "", k1, v1);
     }
   }
@@ -2114,6 +2288,21 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+class TxCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo, uint16_t subValue) override {
+    (void)pCharacteristic;
+    (void)connInfo;
+    // 0 = unsubscribed, >0 = notifications/indications enabled.
+    if (subValue == 0) return;
+    Serial.print("[BLE] TX subscribed value=");
+    Serial.println((unsigned int)subValue);
+    sendProfilesForSensor(normalizeSensor(deviceConfig.sensor));
+    sendConfigPayload();
+    sendFlashStatus();
+    scheduleImmediateSensorPush();
+  }
+};
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override {
     (void)pServer;
@@ -2126,7 +2315,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     Serial.println(connectedCount);
     // Keep advertising to allow multiple centrals to connect
     NimBLEDevice::startAdvertising();
-    sendProfilesForSensor(normalizeSensor(deviceConfig.sensor));
+    // Some centrals don't receive notifications until subscribe event;
+    // still schedule immediate acquisition here.
+    scheduleImmediateSensorPush();
   }
 
   void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override {
@@ -2200,6 +2391,7 @@ static void bleInit() {
       UUID_DATA, NIMBLE_PROPERTY::NOTIFY);
 
   rxChar->setCallbacks(new RxCallbacks());
+  txChar->setCallbacks(new TxCallbacks());
   service->start();
   Serial.println("[BLE] Service started");
 
@@ -2329,83 +2521,18 @@ void loop() {
     }
   }
 
+  if (immediateSamplePending
+      && !csvExportInProgress
+      && (connectedCount > 0 || deviceConfig.storeFlash)) {
+    immediateSamplePending = false;
+    acquireAndPublishSample();
+  }
+
   if (!csvExportInProgress
       && (connectedCount > 0 || deviceConfig.storeFlash)
       && (now - lastSensorMs) >= sensorIntervalMs) {
     lastSensorMs = now;
-    const std::string sensor = normalizeSensor(deviceConfig.sensor);
-    if (sensor == "i2c") {
-      float tempC = 0.0f;
-      float pressHpa = 0.0f;
-      Bme680Reading bme;
-      if (bme680 && readBme680(bme)) {
-        char addr[8];
-        snprintf(addr, sizeof(addr), "0x%02X", bmeAddr);
-        if (connectedCount > 0) {
-          sendMetricPayload("bme680", addr, "temperature", bme.tempC, "pressure", bme.pressHpa);
-          sendMetricPayload("bme680", addr, "humidity", bme.humPct, "gas", bme.gasKOhm);
-          if (isfinite(bme.iaq)) {
-            sendMetricPayload("bme680", addr, "iaq", bme.iaq, "iaq_accuracy", bme.iaqAccuracy);
-          }
-          if (isfinite(bme.co2eq) && isfinite(bme.breathVoc)) {
-            sendMetricPayload("bme680", addr, "co2eq", bme.co2eq, "breath_voc", bme.breathVoc);
-          }
-        }
-        flashLog(bme.tempC, bme.humPct);
-      }
-      if (bmp280 && readBmp280(tempC, pressHpa)) {
-        char addr[8];
-        snprintf(addr, sizeof(addr), "0x%02X", bmpAddr);
-        if (connectedCount > 0) {
-          sendMetricPayload("bmp280", addr, "temperature", tempC, "pressure", pressHpa);
-        }
-        flashLog(tempC, pressHpa);
-      }
-      if (ms5611 && readMs5611(tempC, pressHpa)) {
-        char addr[8];
-        snprintf(addr, sizeof(addr), "0x%02X", msAddr);
-        if (connectedCount > 0) {
-          sendMetricPayload("gy63", addr, "temperature", tempC, "pressure", pressHpa);
-        }
-        flashLog(tempC, pressHpa);
-      }
-    } else if (sensor == "analog" && deviceConfig.analogPin >= 0) {
-      int raw = analogRead(deviceConfig.analogPin);
-      float value = (float)raw;
-      if (connectedCount > 0) {
-        sendMetricPayload("analog", "", "generic", value, nullptr, 0.0f);
-      }
-      flashLog(value, NAN);
-    } else if (sensor == "digital" && deviceConfig.digitalPin >= 0) {
-      float v1 = NAN;
-      float v2 = NAN;
-      bool paired = false;
-      const char *sensorName = "digital";
-      if (readDigitalSensor(v1, v2, paired, sensorName)) {
-        if (connectedCount > 0) {
-          if (paired) {
-            sendMetricPayload(sensorName, "", "temperature", v1, "humidity", v2);
-          } else {
-            sendMetricPayload(sensorName, "", "generic", v1, nullptr, 0.0f);
-          }
-        }
-        flashLog(v1, v2);
-      }
-    } else if (sensor == "onewire" && deviceConfig.onewirePin >= 0) {
-      float value = 0.0f;
-      if (readOneWire(value)) {
-        if (connectedCount > 0) {
-          sendMetricPayload("ds18b20", "", "temperature", value, nullptr, 0.0f);
-        }
-        flashLog(value, NAN);
-      }
-    } else if (sensor == "random") {
-      float value = (float)(random(0, 1000)) / 10.0f;
-      if (connectedCount > 0) {
-        sendMetricPayload("random", "", "generic", value, nullptr, 0.0f);
-      }
-      flashLog(value, NAN);
-    }
+    acquireAndPublishSample();
   }
   delay(10);
 }

@@ -46,8 +46,25 @@ const METRIC_PROFILES = {
   temperature: { label: "Temperature", unit: "°C", min: -10, max: 50 },
   pressure: { label: "Pression", unit: "hPa", min: 900, max: 1100 },
   humidity: { label: "Humidite", unit: "%", min: 0, max: 100 },
+  gas: { label: "Gaz", unit: "KOhm", min: 0, max: 500 },
+  iaq: { label: "IAQ", unit: "", min: 0, max: 500 },
+  iaq_accuracy: { label: "Precision IAQ", unit: "", min: 0, max: 3 },
+  co2eq: { label: "eCO2", unit: "ppm", min: 350, max: 10000 },
+  breath_voc: { label: "VOC", unit: "ppm", min: 0, max: 10 },
   generic: { label: "Valeur", unit: "", min: 0, max: 100 },
 };
+
+const KNOWN_METRIC_KEYS = new Set([
+  "temperature",
+  "pressure",
+  "humidity",
+  "gas",
+  "iaq",
+  "iaq_accuracy",
+  "co2eq",
+  "breath_voc",
+  "generic",
+]);
 
 const SENSOR_LABELS = {
   i2c: "I2C",
@@ -270,7 +287,23 @@ function expandMetricKey(value) {
   if (raw === "t") return "temperature";
   if (raw === "p") return "pressure";
   if (raw === "h") return "humidity";
+  if (raw === "ia") return "iaq_accuracy";
+  if (raw === "co2") return "co2eq";
+  if (raw === "voc") return "breath_voc";
   return raw;
+}
+
+function normalizeMetricKey(rawKey, sensorHint = null) {
+  const raw = String(rawKey || "").trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "g") {
+    const sensor = normalizeKey(sensorHint);
+    if (sensor === "bme680") return "gas";
+    return "generic";
+  }
+  const key = normalizeKey(expandMetricKey(raw));
+  if (!key) return null;
+  return KNOWN_METRIC_KEYS.has(key) ? key : null;
 }
 
 function normalizeText(value, maxLen = 40) {
@@ -1461,6 +1494,17 @@ function splitBleMessages(raw) {
 }
 
 function applyParsedPayload(entry, parsed) {
+  const structuralUpdate = !!(
+    parsed.name
+    || parsed.ack
+    || parsed.sensor
+    || parsed.addr
+    || parsed.csv
+    || parsed.csvChunk
+    || parsed.config
+    || parsed.flash
+  );
+
   if (parsed.sensor) {
     entry.sensor = parsed.sensor;
     upsertRecognizedSensor(entry, parsed.sensor, parsed.addr || entry.address || null);
@@ -1533,7 +1577,7 @@ function applyParsedPayload(entry, parsed) {
   const keys = Object.keys(parsed.metrics);
   const liveTimestamp = parsed.timestamp;
   if (keys.length === 0) {
-    if (parsed.name || parsed.ack || parsed.sensor || parsed.addr || parsed.csv || parsed.csvChunk || parsed.config || parsed.flash || profileEntries.length > 0) {
+    if (structuralUpdate || profileEntries.length > 0) {
       renderAll();
     }
     return;
@@ -1556,7 +1600,14 @@ function applyParsedPayload(entry, parsed) {
     entry.metricOrder = ["generic"];
   }
 
-  renderAll();
+  // High-frequency live data should not recreate config cards at each packet,
+  // otherwise config buttons become hard to click at short refresh rates.
+  if (structuralUpdate || profileEntries.length > 0) {
+    renderAll();
+  } else {
+    renderViz(Array.from(devices.values()));
+    updateControls();
+  }
 }
 
 function decodeValue(view) {
@@ -1852,7 +1903,7 @@ function parsePayload(raw) {
       const metricSource = obj.metrics || obj.m || obj.values || obj.data;
       if (metricSource && typeof metricSource === "object") {
         Object.entries(metricSource).forEach(([rawKey, value]) => {
-          const key = normalizeKey(expandMetricKey(rawKey));
+          const key = normalizeMetricKey(rawKey, sensor);
           const num = toNumber(value);
           if (!key || num === null) return;
           metrics[key] = num;
@@ -1865,13 +1916,6 @@ function parsePayload(raw) {
         if (obj.humidity !== undefined) metrics.humidity = Number(obj.humidity);
         if (obj.value !== undefined) metrics.generic = Number(obj.value);
 
-        Object.entries(obj).forEach(([rawKey, value]) => {
-          const key = normalizeKey(expandMetricKey(rawKey));
-          if (!key || RESERVED_KEYS.has(key)) return;
-          const num = toNumber(value);
-          if (num === null) return;
-          metrics[key] = num;
-        });
       }
 
       const profileSource = obj.profiles || obj.profile || obj.metricProfiles || obj.metric_profiles;
@@ -2011,7 +2055,7 @@ function parsePayload(raw) {
     }
 
     const metricMatch = key.match(/^(?:metric|metrics|value|values|data)\.([a-z0-9_.-]+)$/);
-    const metricKey = metricMatch ? normalizeKey(metricMatch[1]) : key;
+    const metricKey = metricMatch ? normalizeMetricKey(metricMatch[1], sensor) : normalizeMetricKey(key, sensor);
     if (!metricKey || RESERVED_KEYS.has(metricKey)) return;
 
     const value = toNumber(rawValue);
