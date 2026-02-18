@@ -50,7 +50,7 @@ static const uint8_t I2C_ADDR_MS5611_B = 0x76;
 static const uint8_t REG_CHIP_ID = 0xD0;
 static const uint8_t CHIP_ID_BME68X = 0x61;
 static const char *LOG_PATH = "/log.csv";
-static const char *LOG_HEADER = "date_time,value1,value2";
+static const char *LOG_HEADER = "date,temperature,humidity,pressure,iaq,accuracy,voc,eqco2,gas_kohm,generic,sensor,address";
 static const bool DEBUG_VERBOSE = true;
 static const uint8_t NEOPIXEL_COUNT = 1;
 static const uint8_t NEOPIXEL_BRIGHTNESS = 64;
@@ -890,8 +890,8 @@ static void flashClear() {
 
 static size_t estimateLineBytes() {
   const std::string sensor = normalizeSensor(deviceConfig.sensor);
-  if (sensor == "i2c") return 32;
-  return 24;
+  if (sensor == "i2c") return 120;
+  return 96;
 }
 
 static void applyTimeSync(uint64_t epochMs) {
@@ -937,32 +937,79 @@ static void formatTimestamp(uint64_t epochMs, char *out, size_t outLen) {
            tmInfo.tm_hour, tmInfo.tm_min, tmInfo.tm_sec);
 }
 
-static void flashLog(float v1, float v2) {
+static void formatCsvFloat(char *out, size_t outLen, float value, uint8_t decimals = 3) {
+  if (!out || outLen == 0) return;
+  if (!isfinite(value)) {
+    out[0] = '\0';
+    return;
+  }
+  char fmt[8];
+  snprintf(fmt, sizeof(fmt), "%%.%uf", (unsigned int)decimals);
+  snprintf(out, outLen, fmt, value);
+}
+
+static std::string sanitizeCsvToken(const char *token) {
+  if (!token) return "";
+  std::string out(token);
+  for (char &c : out) {
+    if (c == ',' || c == '\n' || c == '\r') c = ' ';
+  }
+  return out;
+}
+
+static void flashLogRow(
+    const char *sensor,
+    const char *address,
+    float temperature,
+    float humidity,
+    float pressure,
+    float iaq,
+    float iaqAccuracy,
+    float voc,
+    float eqco2,
+    float gasKOhm,
+    float generic) {
   if (!deviceConfig.storeFlash) return;
   if (csvExportInProgress) return;
   if (!ensureLogFile()) return;
+
   char tsBuf[24];
-  char v1buf[16];
-  char v2buf[16];
+  char tempBuf[20];
+  char humBuf[20];
+  char pressBuf[20];
+  char iaqBuf[20];
+  char iaAccBuf[20];
+  char vocBuf[20];
+  char co2Buf[20];
+  char gasBuf[20];
+  char genericBuf[20];
   formatTimestamp(currentLocalMs(), tsBuf, sizeof(tsBuf));
-  snprintf(v1buf, sizeof(v1buf), "%.2f", v1);
-  if (isfinite(v2)) {
-    snprintf(v2buf, sizeof(v2buf), "%.2f", v2);
-  } else {
-    v2buf[0] = '\0';
-  }
-  csvLogger.appendRow(tsBuf, v1buf, v2buf);
+  formatCsvFloat(tempBuf, sizeof(tempBuf), temperature);
+  formatCsvFloat(humBuf, sizeof(humBuf), humidity);
+  formatCsvFloat(pressBuf, sizeof(pressBuf), pressure);
+  formatCsvFloat(iaqBuf, sizeof(iaqBuf), iaq);
+  formatCsvFloat(iaAccBuf, sizeof(iaAccBuf), iaqAccuracy);
+  formatCsvFloat(vocBuf, sizeof(vocBuf), voc);
+  formatCsvFloat(co2Buf, sizeof(co2Buf), eqco2);
+  formatCsvFloat(gasBuf, sizeof(gasBuf), gasKOhm);
+  formatCsvFloat(genericBuf, sizeof(genericBuf), generic);
+
+  const std::string sensorSafe = sanitizeCsvToken(sensor);
+  const std::string addrSafe = sanitizeCsvToken(address);
+  char line[320];
+  snprintf(
+      line, sizeof(line), "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+      tsBuf, tempBuf, humBuf, pressBuf, iaqBuf, iaAccBuf, vocBuf, co2Buf, gasBuf, genericBuf,
+      sensorSafe.c_str(), addrSafe.c_str());
+  csvLogger.appendLine(line);
+
   if (DEBUG_VERBOSE) {
-    Serial.print("[FLASH] Log ts=");
+    Serial.print("[FLASH] Log row ts=");
     Serial.print(tsBuf);
-    Serial.print(" v1=");
-    Serial.print(v1, 2);
-    Serial.print(" v2=");
-    if (isfinite(v2)) {
-      Serial.println(v2, 2);
-    } else {
-      Serial.println("nan");
-    }
+    Serial.print(" sensor=");
+    Serial.print(sensorSafe.c_str());
+    Serial.print(" addr=");
+    Serial.println(addrSafe.c_str());
   }
 }
 
@@ -1381,9 +1428,8 @@ static void acquireAndPublishSample() {
           sendMetricPayload("bme680", addr, "breath_voc", bme.breathVoc, nullptr, 0.0f);
         }
       }
-      if (isfinite(bme.tempC) || isfinite(bme.humPct)) {
-        flashLog(bme.tempC, bme.humPct);
-      }
+      flashLogRow("bme680", addr, bme.tempC, bme.humPct, bme.pressHpa, bme.iaq, bme.iaqAccuracy,
+                  bme.breathVoc, bme.co2eq, bme.gasKOhm, NAN);
     }
     if (bmp280 && readBmp280(tempC, pressHpa)) {
       char addr[8];
@@ -1391,7 +1437,7 @@ static void acquireAndPublishSample() {
       if (connectedCount > 0) {
         sendMetricPayload("bmp280", addr, "temperature", tempC, "pressure", pressHpa);
       }
-      flashLog(tempC, pressHpa);
+      flashLogRow("bmp280", addr, tempC, NAN, pressHpa, NAN, NAN, NAN, NAN, NAN, NAN);
     }
     if (ms5611 && readMs5611(tempC, pressHpa)) {
       char addr[8];
@@ -1399,7 +1445,7 @@ static void acquireAndPublishSample() {
       if (connectedCount > 0) {
         sendMetricPayload("gy63", addr, "temperature", tempC, "pressure", pressHpa);
       }
-      flashLog(tempC, pressHpa);
+      flashLogRow("gy63", addr, tempC, NAN, pressHpa, NAN, NAN, NAN, NAN, NAN, NAN);
     }
   } else if (sensor == "analog" && deviceConfig.analogPin >= 0) {
     int raw = analogRead(deviceConfig.analogPin);
@@ -1407,7 +1453,7 @@ static void acquireAndPublishSample() {
     if (connectedCount > 0) {
       sendMetricPayload("analog", "", "generic", value, nullptr, 0.0f);
     }
-    flashLog(value, NAN);
+    flashLogRow("analog", "", NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, value);
   } else if (sensor == "digital" && deviceConfig.digitalPin >= 0) {
     float v1 = NAN;
     float v2 = NAN;
@@ -1421,7 +1467,11 @@ static void acquireAndPublishSample() {
           sendMetricPayload(sensorName, "", "generic", v1, nullptr, 0.0f);
         }
       }
-      flashLog(v1, v2);
+      if (paired) {
+        flashLogRow(sensorName, "", v1, v2, NAN, NAN, NAN, NAN, NAN, NAN, NAN);
+      } else {
+        flashLogRow(sensorName, "", NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, v1);
+      }
     }
   } else if (sensor == "onewire" && deviceConfig.onewirePin >= 0) {
     float value = 0.0f;
@@ -1429,14 +1479,14 @@ static void acquireAndPublishSample() {
       if (connectedCount > 0) {
         sendMetricPayload("ds18b20", "", "temperature", value, nullptr, 0.0f);
       }
-      flashLog(value, NAN);
+      flashLogRow("ds18b20", "", value, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN);
     }
   } else if (sensor == "random") {
     float value = (float)(random(0, 1000)) / 10.0f;
     if (connectedCount > 0) {
       sendMetricPayload("random", "", "generic", value, nullptr, 0.0f);
     }
-    flashLog(value, NAN);
+    flashLogRow("random", "", NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, value);
   }
 }
 

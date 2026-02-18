@@ -31,6 +31,16 @@ bool CsvLogger::appendRow(const char *col1, const char *col2, const char *col3) 
   return true;
 }
 
+bool CsvLogger::appendLine(const char *line) {
+  if (!ensureHeader(true)) return false;
+  File file = fs_.open(path_, "a");
+  if (!file) return false;
+  file.print(line ? line : "");
+  file.print('\n');
+  file.close();
+  return true;
+}
+
 bool CsvLogger::ensureHeader(bool repair) {
   if (!fs_.exists(path_)) {
     File file = fs_.open(path_, "w");

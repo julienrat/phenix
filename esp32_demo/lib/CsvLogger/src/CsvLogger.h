@@ -9,6 +9,7 @@ class CsvLogger {
 
   bool begin(bool repair = true);
   bool appendRow(const char *col1, const char *col2, const char *col3);
+  bool appendLine(const char *line);
   size_t size();
 
  private:

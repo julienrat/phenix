@@ -1220,7 +1220,6 @@ function processHistoryQueue(entry) {
     return;
   }
 
-  const metric = ensureMetric(entry, "generic");
   let processed = 0;
   while (entry.historyQueue.length > 0 && processed < 20) {
     const line = entry.historyQueue.shift();
@@ -1228,7 +1227,8 @@ function processHistoryQueue(entry) {
     const parsed = parseCsvLine(line);
     if (!parsed) continue;
 
-    const { timestamp, value } = parsed;
+    const { timestamp, value, metricKey } = parsed;
+    const metric = ensureMetric(entry, metricKey || "generic");
     pushHistoryEntry(entry, metric, timestamp, value);
   }
 
@@ -1253,13 +1253,37 @@ function formatTimestampForTable(date = new Date()) {
 function parseCsvLine(line) {
   if (!line) return null;
   const trimmed = String(line).trim();
-  if (!trimmed || trimmed.startsWith("date_time,")) return null;
+  if (!trimmed || /^date(?:_time)?,/i.test(trimmed)) return null;
   const parts = trimmed.split(",");
   if (parts.length < 2) return null;
   const timestamp = parts[0].trim();
-  const value = Number(parts[1]);
-  if (!Number.isFinite(value)) return null;
-  return { timestamp, value };
+  if (!timestamp) return null;
+
+  const legacyValue = Number(parts[1]);
+  if (Number.isFinite(legacyValue) && parts.length <= 3) {
+    return { timestamp, value: legacyValue, metricKey: "generic" };
+  }
+
+  const columnMap = [
+    { index: 1, key: "temperature" },
+    { index: 2, key: "humidity" },
+    { index: 3, key: "pressure" },
+    { index: 4, key: "iaq" },
+    { index: 5, key: "iaq_accuracy" },
+    { index: 6, key: "breath_voc" },
+    { index: 7, key: "co2eq" },
+    { index: 8, key: "gas" },
+    { index: 9, key: "generic" },
+  ];
+
+  for (const col of columnMap) {
+    const value = Number(parts[col.index]);
+    if (Number.isFinite(value)) {
+      return { timestamp, value, metricKey: col.key };
+    }
+  }
+
+  return null;
 }
 
 function pushHistoryEntry(entry, metric, timestamp, value) {
@@ -1724,8 +1748,8 @@ function handleCsvChunk(entry, chunk) {
     resetCsvTransfer(entry);
     if (assembled) {
       let csvData = assembled;
-      if (chunk.lineMode && !assembled.startsWith("date_time,")) {
-        csvData = `date_time,value1,value2\n${assembled}`;
+      if (chunk.lineMode && !/^date(?:_time)?,/i.test(assembled)) {
+        csvData = `date,temperature,humidity,pressure,iaq,accuracy,voc,eqco2,gas_kohm,generic,sensor,address\n${assembled}`;
       }
       entry.csvData = csvData;
       updateExportButton(entry);
@@ -1748,7 +1772,7 @@ function handleHistoryBlock(entry, chunk) {
   const data = chunk.data ? String(chunk.data) : "";
   const lines = data.split("\n").map((line) => line.trim()).filter((line) => line);
   lines.forEach((line) => {
-    if (line.startsWith("date_time,")) return;
+    if (/^date(?:_time)?,/i.test(line)) return;
     entry.historyQueue.push(line);
   });
   if (chunk.last === true) {
@@ -1780,7 +1804,7 @@ function handleHistoryInline(entry, csvText) {
   ensureHistoryProcessor(entry);
   const lines = String(csvText).split("\n").map((line) => line.trim()).filter((line) => line);
   lines.forEach((line) => {
-    if (line.startsWith("date_time,")) return;
+    if (/^date(?:_time)?,/i.test(line)) return;
     entry.historyQueue.push(line);
   });
   entry.historyStreamDone = true;
@@ -2429,11 +2453,11 @@ function downloadCsv(entry, csvText) {
 
 function downloadHistoryCsv(entry) {
   if (!entry || !entry.historyAll || entry.historyAll.length === 0) return false;
-  const lines = ["date_time,value1,value2"];
+  const lines = ["date,generic"];
   entry.historyAll.forEach((row) => {
     const ts = row.timestamp || "";
     const val = Number.isFinite(row.value) ? row.value.toFixed(2) : "";
-    lines.push(`${ts},${val},`);
+    lines.push(`${ts},${val}`);
   });
   downloadCsv(entry, lines.join("\n"));
   return true;
