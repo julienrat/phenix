@@ -440,6 +440,15 @@ input[type="number"] {
   color: #c96f4a;
 }
 
+.config-detected {
+  font-size: 13px;
+  color: var(--muted);
+  background: rgba(21, 19, 15, 0.04);
+  border: 1px solid rgba(21, 19, 15, 0.08);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
 .btn {
   border: none;
   border-radius: 999px;

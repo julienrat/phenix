@@ -5,6 +5,8 @@
 #include <NimBLEAdvertisementData.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_NeoPixel.h>
+#include <bsec2.h>
+#include <DHT.h>
 #include <MS5611.h>
 #include <Preferences.h>
 #include <LittleFS.h>
@@ -37,6 +39,8 @@ static const uint8_t I2C_ADDR_BMP280_A = 0x76;
 static const uint8_t I2C_ADDR_BMP280_B = 0x77;
 static const uint8_t I2C_ADDR_MS5611_A = 0x77;
 static const uint8_t I2C_ADDR_MS5611_B = 0x76;
+static const uint8_t REG_CHIP_ID = 0xD0;
+static const uint8_t CHIP_ID_BME68X = 0x61;
 static const char *LOG_PATH = "/log.csv";
 static const char *LOG_HEADER = "date_time,value1,value2";
 static const bool DEBUG_VERBOSE = true;
@@ -52,6 +56,12 @@ static uint16_t bleMtu = 23;
 static uint32_t lastBeat = 0;
 static uint32_t lastSensorMs = 0;
 static uint32_t lastScanMs = 0;
+static bool i2cScanPending = false;
+static bool sensorInitPending = true;
+static uint32_t sensorInitAt = 0;
+static bool i2cBusReady = false;
+static int activeI2cSda = -1;
+static int activeI2cScl = -1;
 static bool bleResetPending = false;
 static uint32_t bleResetAt = 0;
 static bool csvExportInProgress = false;
@@ -78,10 +88,13 @@ static CsvLogger csvLogger(LittleFS, LOG_PATH, LOG_HEADER);
 #endif
 
 static Adafruit_BMP280 *bmp280 = nullptr;
+static Bsec2 *bme680 = nullptr;
 static MS5611 *ms5611 = nullptr;
 static OneWire *oneWire = nullptr;
 static DallasTemperature *ds18b20 = nullptr;
+static DHT *dht = nullptr;
 static uint8_t bmpAddr = 0;
+static uint8_t bmeAddr = 0;
 static uint8_t msAddr = 0;
 static Preferences prefs;
 static bool prefsReady = false;
@@ -93,6 +106,27 @@ static int buttonStableState = HIGH;
 static int buttonLastRead = HIGH;
 static uint32_t buttonLastChangeMs = 0;
 static const uint32_t BUTTON_DEBOUNCE_MS = 40;
+static const float BME680_SAMPLE_RATE = BSEC_SAMPLE_RATE_LP;
+
+struct Bme680Reading {
+  float tempC = NAN;
+  float pressHpa = NAN;
+  float humPct = NAN;
+  float gasKOhm = NAN;
+  float iaq = NAN;
+  float staticIaq = NAN;
+  float co2eq = NAN;
+  float breathVoc = NAN;
+  float iaqAccuracy = NAN;
+};
+
+enum DigitalSensorType {
+  DIGITAL_SENSOR_NONE = 0,
+  DIGITAL_SENSOR_DHT11,
+  DIGITAL_SENSOR_DHT22
+};
+
+static DigitalSensorType digitalSensorType = DIGITAL_SENSOR_NONE;
 
 struct DeviceConfig {
   std::string name;
@@ -169,6 +203,9 @@ static void sendNextCsvBlock();
 static void sendCsvFromFlash();
 static void handleSerialCommands();
 static void dumpCsvToSerial();
+static void clearDigitalSensor();
+static void detectDigitalSensor();
+static bool readDigitalSensor(float &v1, float &v2, bool &paired, const char *&sensorName);
 
 static std::string trimCopy(const std::string &input) {
   size_t start = 0;
@@ -768,6 +805,14 @@ static void sendProfilesForSensor(const std::string &sensor) {
   if (sensor == "i2c") {
     addProfile("temperature", "Temperature", "C", -10, 50);
     addProfile("pressure", "Pression", "hPa", 900, 1100);
+    addProfile("humidity", "Humidite", "%", 0, 100);
+    addProfile("gas", "Gaz", "KOhm", 0, 500);
+    addProfile("iaq", "IAQ", "", 0, 500);
+    addProfile("iaq_accuracy", "Precision IAQ", "", 0, 3);
+  } else if (sensor == "digital") {
+    addProfile("temperature", "Temperature", "C", -10, 80);
+    addProfile("humidity", "Humidite", "%", 0, 100);
+    addProfile("generic", "Etat GPIO", "", 0, 1);
   } else if (sensor == "onewire") {
     addProfile("temperature", "Temperature", "C", -10, 50);
   } else {
@@ -1176,9 +1221,21 @@ static void handleSerialCommands() {
 static void applyI2cConfig() {
   int sda = deviceConfig.i2cSda >= 0 ? deviceConfig.i2cSda : I2C_SDA;
   int scl = deviceConfig.i2cScl >= 0 ? deviceConfig.i2cScl : I2C_SCL;
-  Wire.begin(sda, scl);
-  Wire.setClock(400000);
-  scanSensors();
+  if (!i2cBusReady || sda != activeI2cSda || scl != activeI2cScl) {
+    Wire.begin(sda, scl);
+    Wire.setClock(100000);
+    Wire.setTimeOut(20);
+    i2cBusReady = true;
+    activeI2cSda = sda;
+    activeI2cScl = scl;
+    Serial.print("[I2C] Init done SDA=");
+    Serial.print(sda);
+    Serial.print(" SCL=");
+    Serial.println(scl);
+  }
+  i2cScanPending = true;
+  lastScanMs = millis();
+  Serial.println("[I2C] Deferred scan");
 }
 
 static void clearOneWire() {
@@ -1200,21 +1257,83 @@ static void initOneWire() {
   ds18b20->begin();
 }
 
+static void clearDigitalSensor() {
+  if (dht) {
+    delete dht;
+    dht = nullptr;
+  }
+  digitalSensorType = DIGITAL_SENSOR_NONE;
+}
+
+static bool tryInitDht(uint8_t dhtType) {
+  if (deviceConfig.digitalPin < 0) return false;
+  DHT *candidate = new DHT(deviceConfig.digitalPin, dhtType);
+  candidate->begin();
+  delay(1200);
+  float h = candidate->readHumidity();
+  float t = candidate->readTemperature();
+  if (isfinite(h) && isfinite(t)) {
+    dht = candidate;
+    digitalSensorType = (dhtType == DHT11) ? DIGITAL_SENSOR_DHT11 : DIGITAL_SENSOR_DHT22;
+    Serial.print("[DIGITAL] DHT detecte sur GPIO ");
+    Serial.print(deviceConfig.digitalPin);
+    Serial.print(" type=");
+    Serial.println(dhtType == DHT11 ? "DHT11" : "DHT22");
+    return true;
+  }
+  delete candidate;
+  return false;
+}
+
+static void detectDigitalSensor() {
+  clearDigitalSensor();
+  if (deviceConfig.digitalPin < 0) return;
+  pinMode(deviceConfig.digitalPin, INPUT_PULLUP);
+  if (tryInitDht(DHT22)) return;
+  if (tryInitDht(DHT11)) return;
+  pinMode(deviceConfig.digitalPin, INPUT);
+  Serial.print("[DIGITAL] Aucun DHT detecte sur GPIO ");
+  Serial.println(deviceConfig.digitalPin);
+}
+
+static bool readDigitalSensor(float &v1, float &v2, bool &paired, const char *&sensorName) {
+  if (dht && (digitalSensorType == DIGITAL_SENSOR_DHT11 || digitalSensorType == DIGITAL_SENSOR_DHT22)) {
+    const float h = dht->readHumidity();
+    const float t = dht->readTemperature();
+    if (isfinite(h) && isfinite(t)) {
+      v1 = t;
+      v2 = h;
+      paired = true;
+      sensorName = (digitalSensorType == DIGITAL_SENSOR_DHT11) ? "dht11" : "dht22";
+      return true;
+    }
+  }
+  if (deviceConfig.digitalPin < 0) return false;
+  v1 = (float)(digitalRead(deviceConfig.digitalPin) ? 1 : 0);
+  v2 = NAN;
+  paired = false;
+  sensorName = "digital";
+  return true;
+}
+
 static void applySensorMode() {
   const std::string sensor = normalizeSensor(deviceConfig.sensor);
   if (sensor == "i2c") {
     clearOneWire();
+    clearDigitalSensor();
     applyI2cConfig();
     return;
   }
   clearSensors();
   if (sensor == "onewire") {
+    clearDigitalSensor();
     initOneWire();
+  } else if (sensor == "digital") {
+    clearOneWire();
+    detectDigitalSensor();
   } else {
     clearOneWire();
-  }
-  if (sensor == "digital" && deviceConfig.digitalPin >= 0) {
-    pinMode(deviceConfig.digitalPin, INPUT);
+    clearDigitalSensor();
   }
 }
 
@@ -1573,6 +1692,16 @@ static bool i2cPresent(uint8_t addr) {
   return Wire.endTransmission() == 0;
 }
 
+static bool i2cReadByte(uint8_t addr, uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  const uint8_t readLen = Wire.requestFrom((int)addr, 1);
+  if (readLen != 1 || !Wire.available()) return false;
+  value = Wire.read();
+  return true;
+}
+
 static void i2cScan() {
   Serial.println("[I2C] Scan...");
   int found = 0;
@@ -1583,6 +1712,7 @@ static void i2cScan() {
       Serial.println(addr, HEX);
       found++;
     }
+    if ((addr & 0x07) == 0) delay(1);
   }
   if (found == 0) {
     Serial.println("[I2C] Aucun peripherique detecte");
@@ -1594,16 +1724,22 @@ static void clearSensors() {
     delete bmp280;
     bmp280 = nullptr;
   }
+  if (bme680) {
+    delete bme680;
+    bme680 = nullptr;
+  }
   if (ms5611) {
     delete ms5611;
     ms5611 = nullptr;
   }
   bmpAddr = 0;
+  bmeAddr = 0;
   msAddr = 0;
 }
 
 static bool tryMs5611(uint8_t addr) {
   if (!i2cPresent(addr) || ms5611) return false;
+  delay(1);
   ms5611 = new MS5611(addr);
   if (ms5611->begin()) {
     msAddr = addr;
@@ -1618,7 +1754,8 @@ static bool tryMs5611(uint8_t addr) {
 }
 
 static bool tryBmp280(uint8_t addr) {
-  if (!i2cPresent(addr) || bmp280 || msAddr == addr) return false;
+  if (!i2cPresent(addr) || bmp280 || msAddr == addr || bmeAddr == addr) return false;
+  delay(1);
   bmp280 = new Adafruit_BMP280();
   if (bmp280->begin(addr)) {
     bmpAddr = addr;
@@ -1639,21 +1776,86 @@ static bool tryBmp280(uint8_t addr) {
   return false;
 }
 
+static bool tryBme680(uint8_t addr) {
+  if (!i2cPresent(addr) || bme680 || msAddr == addr || bmpAddr == addr) return false;
+  uint8_t chipId = 0;
+  if (!i2cReadByte(addr, REG_CHIP_ID, chipId) || chipId != CHIP_ID_BME68X) {
+    if (DEBUG_VERBOSE) {
+      Serial.print("[BSEC] Skip 0x");
+      if (addr < 16) Serial.print("0");
+      Serial.print(addr, HEX);
+      Serial.print(" chip_id=0x");
+      if (chipId < 16) Serial.print("0");
+      Serial.println(chipId, HEX);
+    }
+    return false;
+  }
+  delay(1);
+  bme680 = new Bsec2();
+  Serial.print("[BSEC] Init on 0x");
+  if (addr < 16) Serial.print("0");
+  Serial.println(addr, HEX);
+  if (bme680->begin(addr, Wire)) {
+    bsecSensor sensorList[] = {
+      BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE,
+      BSEC_OUTPUT_RAW_PRESSURE,
+      BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY,
+      BSEC_OUTPUT_RAW_GAS,
+      BSEC_OUTPUT_IAQ,
+      BSEC_OUTPUT_STATIC_IAQ,
+      BSEC_OUTPUT_CO2_EQUIVALENT,
+      BSEC_OUTPUT_BREATH_VOC_EQUIVALENT
+    };
+    bme680->setTemperatureOffset(TEMP_OFFSET_LP);
+    delay(1);
+    if (!bme680->updateSubscription(sensorList, ARRAY_LEN(sensorList), BME680_SAMPLE_RATE)) {
+      Serial.print("[BSEC] updateSubscription failed status=");
+      Serial.println((int)bme680->status);
+      delete bme680;
+      bme680 = nullptr;
+      return false;
+    }
+    bmeAddr = addr;
+    Serial.print("[I2C] BME680 detecte a 0x");
+    if (addr < 16) Serial.print("0");
+    Serial.println(addr, HEX);
+    if (bme680->status > BSEC_OK) {
+      Serial.print("[BSEC] Warning status=");
+      Serial.println((int)bme680->status);
+    }
+    return true;
+  }
+  delete bme680;
+  bme680 = nullptr;
+  return false;
+}
+
 static void scanSensors() {
+  Serial.println("[I2C] scanSensors start");
   clearSensors();
   i2cScan();
 
   // Try MS5611 first on both possible addresses (0x77, sometimes 0x76)
   tryMs5611(I2C_ADDR_MS5611_A);
+  delay(1);
   tryMs5611(I2C_ADDR_MS5611_B);
+  delay(1);
+
+  // Then try BME680 on both possible addresses
+  tryBme680(I2C_ADDR_BMP280_A);
+  delay(1);
+  tryBme680(I2C_ADDR_BMP280_B);
+  delay(1);
 
   // Then try BMP280 on both addresses if not already taken by MS5611
   tryBmp280(I2C_ADDR_BMP280_A);
+  delay(1);
   tryBmp280(I2C_ADDR_BMP280_B);
 
-  if (!bmp280 && !ms5611) {
+  if (!bmp280 && !bme680 && !ms5611) {
     Serial.println("[I2C] Aucun capteur reconnu");
   }
+  Serial.println("[I2C] scanSensors done");
 }
 
 static bool readBmp280(float &tempC, float &pressHpa) {
@@ -1671,6 +1873,58 @@ static bool readMs5611(float &tempC, float &pressHpa) {
   return isfinite(tempC) && isfinite(pressHpa);
 }
 
+static bool readBme680(Bme680Reading &reading) {
+  if (!bme680) return false;
+  if (!bme680->run()) {
+    if (bme680->status < BSEC_OK || bme680->sensor.status < BME68X_OK) {
+      Serial.print("[BSEC] Error status=");
+      Serial.print((int)bme680->status);
+      Serial.print(" bme=");
+      Serial.println((int)bme680->sensor.status);
+    }
+    return false;
+  }
+  const bsecOutputs *outputs = bme680->getOutputs();
+  if (!outputs || outputs->nOutputs == 0) return false;
+
+  bool hasCore = false;
+  for (uint8_t i = 0; i < outputs->nOutputs; i++) {
+    const bsecData out = outputs->output[i];
+    switch (out.sensor_id) {
+      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_TEMPERATURE:
+        reading.tempC = out.signal;
+        break;
+      case BSEC_OUTPUT_RAW_PRESSURE:
+        reading.pressHpa = out.signal / 100.0f;
+        break;
+      case BSEC_OUTPUT_SENSOR_HEAT_COMPENSATED_HUMIDITY:
+        reading.humPct = out.signal;
+        break;
+      case BSEC_OUTPUT_RAW_GAS:
+        reading.gasKOhm = out.signal / 1000.0f;
+        break;
+      case BSEC_OUTPUT_IAQ:
+        reading.iaq = out.signal;
+        reading.iaqAccuracy = (float)out.accuracy;
+        break;
+      case BSEC_OUTPUT_STATIC_IAQ:
+        reading.staticIaq = out.signal;
+        break;
+      case BSEC_OUTPUT_CO2_EQUIVALENT:
+        reading.co2eq = out.signal;
+        break;
+      case BSEC_OUTPUT_BREATH_VOC_EQUIVALENT:
+        reading.breathVoc = out.signal;
+        break;
+      default:
+        break;
+    }
+  }
+  hasCore = isfinite(reading.tempC) && isfinite(reading.pressHpa)
+    && isfinite(reading.humPct) && isfinite(reading.gasKOhm);
+  return hasCore;
+}
+
 static bool readOneWire(float &tempC) {
   if (!ds18b20) return false;
   ds18b20->requestTemperatures();
@@ -1686,6 +1940,11 @@ static const char *compactMetricKey(const char *key) {
   if (strcmp(key, "temperature") == 0) return "t";
   if (strcmp(key, "pressure") == 0) return "p";
   if (strcmp(key, "humidity") == 0) return "h";
+  if (strcmp(key, "gas") == 0) return "g";
+  if (strcmp(key, "iaq") == 0) return "iaq";
+  if (strcmp(key, "iaq_accuracy") == 0) return "ia";
+  if (strcmp(key, "co2eq") == 0) return "co2";
+  if (strcmp(key, "breath_voc") == 0) return "voc";
   return key;
 }
 
@@ -1703,22 +1962,22 @@ static void sendMetricPayload(const char *sensor, const char *addr, const char *
   if (key2) {
     if (haveTs) {
       snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f,\"%s\":%.2f},\"ts\":\"%s\"}",
-               k1, v1, k2, v2, tsBuf);
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f,\"%s\":%.2f},\"ts\":\"%s\"}",
+               sensor ? sensor : "", k1, v1, k2, v2, tsBuf);
     } else {
       snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f,\"%s\":%.2f}}",
-               k1, v1, k2, v2);
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f,\"%s\":%.2f}}",
+               sensor ? sensor : "", k1, v1, k2, v2);
     }
   } else {
     if (haveTs) {
       snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f},\"ts\":\"%s\"}",
-               k1, v1, tsBuf);
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f},\"ts\":\"%s\"}",
+               sensor ? sensor : "", k1, v1, tsBuf);
     } else {
       snprintf(payload, sizeof(payload),
-               "{\"m\":{\"%s\":%.2f}}",
-               k1, v1);
+               "{\"s\":\"%s\",\"m\":{\"%s\":%.2f}}",
+               sensor ? sensor : "", k1, v1);
     }
   }
 #else
@@ -1995,6 +2254,17 @@ void setup() {
   printBootInfo();
   ensureLittleFS();
   loadConfig();
+  // Migrate legacy stored pins on ESP32-C3 (older builds used 11/12).
+  if (deviceConfig.i2cSda == 11 && deviceConfig.i2cScl == 12
+      && (I2C_SDA != 11 || I2C_SCL != 12)) {
+    deviceConfig.i2cSda = I2C_SDA;
+    deviceConfig.i2cScl = I2C_SCL;
+    saveConfig();
+    Serial.print("[I2C] Migrated pins to SDA=");
+    Serial.print(deviceConfig.i2cSda);
+    Serial.print(" SCL=");
+    Serial.println(deviceConfig.i2cScl);
+  }
   if (deviceConfig.i2cSda < 0) deviceConfig.i2cSda = I2C_SDA;
   if (deviceConfig.i2cScl < 0) deviceConfig.i2cScl = I2C_SCL;
   if (deviceConfig.sensor.empty()) deviceConfig.sensor = "i2c";
@@ -2008,7 +2278,10 @@ void setup() {
   Serial.print(deviceConfig.i2cSda);
   Serial.print(" SCL=");
   Serial.println(deviceConfig.i2cScl);
-  applySensorMode();
+  applyI2cConfig();
+  sensorInitPending = true;
+  sensorInitAt = millis() + 3000;
+  Serial.println("[SENSOR] Init deferred");
   applyUserIo();
   bleInit();
 }
@@ -2022,6 +2295,13 @@ void loop() {
   }
 
   const uint32_t now = millis();
+  if (sensorInitPending && (int32_t)(now - sensorInitAt) >= 0) {
+    sensorInitPending = false;
+    Serial.println("[SENSOR] Init start");
+    applySensorMode();
+    Serial.println("[SENSOR] Init done");
+  }
+
   if (!serialDumpInProgress && now - lastBeat >= HEARTBEAT_MS) {
     lastBeat = now;
     Serial.print("[ALIVE] ms=");
@@ -2043,8 +2323,9 @@ void loop() {
 
   if (now - lastScanMs >= RESCAN_INTERVAL_MS) {
     lastScanMs = now;
-    if (!bmp280 && !ms5611 && deviceConfig.sensor == "i2c") {
+    if (deviceConfig.sensor == "i2c" && (i2cScanPending || (!bmp280 && !bme680 && !ms5611))) {
       scanSensors();
+      i2cScanPending = false;
     }
   }
 
@@ -2056,6 +2337,22 @@ void loop() {
     if (sensor == "i2c") {
       float tempC = 0.0f;
       float pressHpa = 0.0f;
+      Bme680Reading bme;
+      if (bme680 && readBme680(bme)) {
+        char addr[8];
+        snprintf(addr, sizeof(addr), "0x%02X", bmeAddr);
+        if (connectedCount > 0) {
+          sendMetricPayload("bme680", addr, "temperature", bme.tempC, "pressure", bme.pressHpa);
+          sendMetricPayload("bme680", addr, "humidity", bme.humPct, "gas", bme.gasKOhm);
+          if (isfinite(bme.iaq)) {
+            sendMetricPayload("bme680", addr, "iaq", bme.iaq, "iaq_accuracy", bme.iaqAccuracy);
+          }
+          if (isfinite(bme.co2eq) && isfinite(bme.breathVoc)) {
+            sendMetricPayload("bme680", addr, "co2eq", bme.co2eq, "breath_voc", bme.breathVoc);
+          }
+        }
+        flashLog(bme.tempC, bme.humPct);
+      }
       if (bmp280 && readBmp280(tempC, pressHpa)) {
         char addr[8];
         snprintf(addr, sizeof(addr), "0x%02X", bmpAddr);
@@ -2080,17 +2377,25 @@ void loop() {
       }
       flashLog(value, NAN);
     } else if (sensor == "digital" && deviceConfig.digitalPin >= 0) {
-      int raw = digitalRead(deviceConfig.digitalPin);
-      float value = (float)(raw ? 1 : 0);
-      if (connectedCount > 0) {
-        sendMetricPayload("digital", "", "generic", value, nullptr, 0.0f);
+      float v1 = NAN;
+      float v2 = NAN;
+      bool paired = false;
+      const char *sensorName = "digital";
+      if (readDigitalSensor(v1, v2, paired, sensorName)) {
+        if (connectedCount > 0) {
+          if (paired) {
+            sendMetricPayload(sensorName, "", "temperature", v1, "humidity", v2);
+          } else {
+            sendMetricPayload(sensorName, "", "generic", v1, nullptr, 0.0f);
+          }
+        }
+        flashLog(v1, v2);
       }
-      flashLog(value, NAN);
     } else if (sensor == "onewire" && deviceConfig.onewirePin >= 0) {
       float value = 0.0f;
       if (readOneWire(value)) {
         if (connectedCount > 0) {
-          sendMetricPayload("onewire", "", "temperature", value, nullptr, 0.0f);
+          sendMetricPayload("ds18b20", "", "temperature", value, nullptr, 0.0f);
         }
         flashLog(value, NAN);
       }

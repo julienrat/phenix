@@ -49,6 +49,20 @@ const METRIC_PROFILES = {
   generic: { label: "Valeur", unit: "", min: 0, max: 100 },
 };
 
+const SENSOR_LABELS = {
+  i2c: "I2C",
+  onewire: "One Wire",
+  analog: "Analogique",
+  digital: "Numerique",
+  random: "Random",
+  bme680: "bme680",
+  bmp280: "bmp280",
+  gy63: "ms5611",
+  ds18b20: "ds18b20",
+  dht11: "dht11",
+  dht22: "dht22",
+};
+
 const RESERVED_KEYS = new Set([
   "sensor",
   "type",
@@ -92,6 +106,7 @@ const configModalPins = document.getElementById("configModalPins");
 const configModalFrequency = document.getElementById("configModalFrequency");
 const configModalStoreFlash = document.getElementById("configModalStoreFlash");
 const configModalStatus = document.getElementById("configModalStatus");
+const configModalDetected = document.getElementById("configModalDetected");
 const configModalClose = document.getElementById("configModalClose");
 const configModalClearFlash = document.getElementById("configModalClearFlash");
 const configModalExportFlash = document.getElementById("configModalExportFlash");
@@ -394,6 +409,40 @@ function ensureConfigDraft(entry) {
   return draft;
 }
 
+function sensorLabel(sensor) {
+  const key = normalizeKey(sensor) || String(sensor || "").toLowerCase();
+  return SENSOR_LABELS[key] || String(sensor || "Inconnu").toUpperCase();
+}
+
+function upsertRecognizedSensor(entry, sensor, addr = null) {
+  const normalized = normalizeKey(sensor);
+  if (!normalized) return;
+  if (normalized === "i2c") return;
+  if (!entry.recognizedSensors) entry.recognizedSensors = [];
+  const normalizedAddr = addr ? String(addr).toLowerCase() : "";
+  const exists = entry.recognizedSensors.some((item) =>
+    item && item.sensor === normalized && (item.addr || "") === normalizedAddr
+  );
+  if (!exists) {
+    entry.recognizedSensors.push({ sensor: normalized, addr: normalizedAddr || null });
+  }
+}
+
+function getRecognizedSensors(entry) {
+  const list = Array.isArray(entry.recognizedSensors) ? entry.recognizedSensors : [];
+  if (list.length === 0) return [];
+  return list.map((item) => {
+    const label = sensorLabel(item.sensor);
+    return item.addr ? `${label} (${item.addr})` : label;
+  });
+}
+
+function getPrimarySensorLabel(entry) {
+  const recognized = getRecognizedSensors(entry);
+  if (recognized.length > 0) return recognized[0];
+  return sensorLabel(entry.sensor || "Inconnu");
+}
+
 function getActiveModalEntry() {
   if (!activeModalEntryId) return null;
   return devices.get(activeModalEntryId) || null;
@@ -603,6 +652,7 @@ function applyConfigUpdate(entry, config, options = {}) {
     entry.historyRows = [];
     entry.historyQueue = [];
     entry.historyLoading = false;
+    entry.recognizedSensors = [];
   }
 
   if (entry.sensor && entry.sensor === "random") {
@@ -698,6 +748,7 @@ function openConfigModal(entry) {
   if (configModalStoreFlash) configModalStoreFlash.checked = !!draft.storeFlash;
 
   renderModalPinFields(draft);
+  renderModalDetectedSensors(entry);
   updateModalStatusForEntry(entry);
   updateExportButton(entry);
 
@@ -723,7 +774,18 @@ function updateModalStatusForEntry(entry) {
   const draft = ensureConfigDraft(entry);
   configModalStatus.textContent = draft.status ? draft.status.message : "";
   configModalStatus.className = `config-status ${draft.status ? draft.status.type : ""}`;
+  renderModalDetectedSensors(entry);
   updateExportButton(entry);
+}
+
+function renderModalDetectedSensors(entry) {
+  if (!configModalDetected) return;
+  const recognized = getRecognizedSensors(entry);
+  if (recognized.length === 0) {
+    configModalDetected.textContent = "Capteurs reconnus: aucun (en attente de mesures).";
+    return;
+  }
+  configModalDetected.textContent = `Capteurs reconnus: ${recognized.join(", ")}`;
 }
 
 async function requestConfig(entry) {
@@ -1399,7 +1461,10 @@ function splitBleMessages(raw) {
 }
 
 function applyParsedPayload(entry, parsed) {
-  if (parsed.sensor) entry.sensor = parsed.sensor;
+  if (parsed.sensor) {
+    entry.sensor = parsed.sensor;
+    upsertRecognizedSensor(entry, parsed.sensor, parsed.addr || entry.address || null);
+  }
   if (parsed.addr) entry.address = parsed.addr;
   if (parsed.name) {
     entry.name = parsed.name;
@@ -1713,6 +1778,7 @@ function parsePayload(raw) {
       const obj = JSON.parse(raw);
       if (obj.sensor) sensor = String(obj.sensor).toLowerCase();
       if (obj.type) sensor = String(obj.type).toLowerCase();
+      if (obj.s && !sensor) sensor = String(obj.s).toLowerCase();
       if (obj.name) name = String(obj.name);
       if (obj.addr) addr = String(obj.addr);
       if (obj.i2c) addr = String(obj.i2c);
@@ -2005,13 +2071,16 @@ function renderConfig(list) {
 
     const meta = document.createElement("div");
     meta.className = "config-meta";
-    const sensorLabel = entry.sensor || "Inconnu";
+    const primarySensorLabel = getPrimarySensorLabel(entry);
     const addrLabel = entry.address || "--";
+    const recognized = getRecognizedSensors(entry);
+    const recognizedLabel = recognized.length ? recognized.join(", ") : "Aucun";
     const flashLabel = formatFlashSummary(entry.flash);
     const flashPercent = getFlashPercent(entry.flash);
     meta.innerHTML = `
-      <div><strong>Capteur:</strong> ${sensorLabel}</div>
+      <div><strong>Capteur:</strong> ${primarySensorLabel}</div>
       <div><strong>Adresse:</strong> ${addrLabel}</div>
+      <div><strong>Reconnu(s):</strong> ${recognizedLabel}</div>
       <div><strong>FS:</strong> ${flashLabel}</div>
     `;
 
